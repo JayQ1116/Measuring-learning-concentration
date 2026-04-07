@@ -24,6 +24,15 @@ python dryrun.py
 
 Quit realtime window with key `q`.
 
+### Runtime Hotkeys
+
+- `a`: Ask LLM anytime (type question in terminal)
+- `n`: Next PDF page
+- `p`: Previous PDF page
+- `m`: Toggle student camera window compact/maximized
+- `t`: Toggle student camera window topmost (floating)
+- `q`: Quit
+
 ## Project Structure And File Summary
 
 ### Root files

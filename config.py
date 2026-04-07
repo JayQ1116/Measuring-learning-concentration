@@ -21,7 +21,7 @@ class PipelineConfig:
     prev_page_key: str = "p"
     toggle_window_key: str = "m"
     toggle_topmost_key: str = "t"
-    pdf_path: str = "assets/pdf/lesson1.pdf"
+    pdf_path: str ="assets/pdf/lesson1.pdf"
     pdf_window_name: str = "Courseware PDF"
     compact_width: int = 520
     compact_height: int = 300

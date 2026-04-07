@@ -12,6 +12,8 @@ def main() -> None:
         current_page=10,
         sync_interval=2,
         camera_index=0,
+        pdf_path="assets/pdf/courseware.pdf",
+        confusion_high_threshold=2,
     )
     run_realtime_pipeline(config)
 
