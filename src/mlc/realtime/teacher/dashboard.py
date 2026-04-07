@@ -22,6 +22,8 @@ def generate_teacher_report(config: PipelineConfig) -> None:
 
     page_summary: Dict[int, List[float]] = defaultdict(list)
     at_risk_students: List[str] = []
+    low_focus_pages: set[int] = set()
+    high_confusion_pages: set[int] = set()
 
     print("\n" + "=" * 45)
     print("   [TEACHER REAL-TIME DASHBOARD]")
@@ -30,13 +32,21 @@ def generate_teacher_report(config: PipelineConfig) -> None:
     for student_id, data in GLOBAL_CLASS_DATA.items():
         score = float(data["focus_score"])
         page = int(data["page"])
+        confusion_count = int(data.get("confusion_count_on_page", 0))
         state = classify_state(score, config)
 
         if score <= config.slight_distracted_threshold:
             at_risk_students.append(f"{student_id}({state})")
+            low_focus_pages.add(page)
+
+        if confusion_count >= config.confusion_high_threshold:
+            high_confusion_pages.add(page)
 
         page_summary[page].append(score)
-        print(f"   - Student[{student_id}]: score {score:.2f} | state {state}")
+        print(
+            f"   - Student[{student_id}]: score {score:.2f} | state {state} "
+            f"| confusion(page) {confusion_count}"
+        )
 
     print("\n   [Page Heatmap]")
     for page, scores in page_summary.items():
@@ -51,4 +61,12 @@ def generate_teacher_report(config: PipelineConfig) -> None:
 
     if at_risk_students:
         print(f"\n   Warning students: {at_risk_students}")
+
+    print("\n   [Teaching Attention Pages]")
+    print(f"   - Low focus pages: {sorted(low_focus_pages) if low_focus_pages else []}")
+    print(
+        "   - High confusion pages: "
+        f"{sorted(high_confusion_pages) if high_confusion_pages else []}"
+    )
+
     print("=" * 45)
