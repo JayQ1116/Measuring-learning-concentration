@@ -1,222 +1,155 @@
-"""Dry run implementation for a learning concentration monitoring system.
-
-This script simulates an end-to-end pipeline:
-1) Video frame collection
-2) ViT-like frame-level inference (simulated)
-3) Sliding-window smoothing
-4) State classification
-5) Intervention decision
-6) RAG + LLM feedback (simulated)
-7) UI rendering
-8) Teacher-side sync
-"""
-
 from __future__ import annotations
-
+import cv2
+import time
 import random
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-
-Prediction = Tuple[float, str]
-
-
+# --- 1. 配置与数据结构 ---
 @dataclass
 class PipelineConfig:
-	fps: int = 30
-	duration_seconds: int = 5
-	window_seconds: int = 5
-	focused_threshold: float = 0.7
-	slight_distracted_threshold: float = 0.4
-	student_id: str = "A01"
-	rag_page: str = "PDF_page_10"
-	random_seed: int = 42
+    fps: int = 30
+    window_seconds: int = 5              # 滑动窗口时长
+    focused_threshold: float = 0.7       # 专注阈值
+    slight_distracted_threshold: float = 0.4
+    student_id: str = "GAO_LUO_01"       # 唯一学生标识
+    rag_page: str = "PDF_Page_10"        # 当前阅读页码
+    sync_interval: int = 2               # 同步频率（秒）
 
+# --- 2. 学生端模块 (Student Side) ---
 
-def collect_video_frames(config: PipelineConfig) -> List[int]:
-	"""Simulate frame indices collected from a camera stream."""
-	frame_count = config.fps * config.duration_seconds
-	return list(range(frame_count))
+def get_vit_prediction(frame) -> Tuple[float, str]:
+    """[Module A] 视觉感知：此处对接真实的 ViT 推理接口"""
+    # 模拟真实环境下模型对当前帧的实时置信度输出
+    score = random.uniform(0.1, 0.95) 
+    label = "Focused" if score > 0.6 else "Distracted"
+    return score, label
 
-
-def run_vit_model(frames: List[int]) -> List[Prediction]:
-	"""Simulate per-frame ViT predictions with concentration drift over time."""
-	results: List[Prediction] = []
-	split_index = int(len(frames) * 0.53)
-
-	for i, _frame in enumerate(frames):
-		if i < split_index:
-			score = random.uniform(0.8, 0.9)
-			label = "Focused"
-		else:
-			score = random.uniform(0.3, 0.5)
-			label = "Distracted"
-		results.append((score, label))
-
-	return results
-
-
-def sliding_window(predictions: List[Prediction], window_size: int) -> float:
-	"""Compute mean score of the latest window to smooth short-term noise."""
-	scores = [score for score, _label in predictions]
-	effective_window = min(window_size, len(scores))
-	recent_scores = scores[-effective_window:]
-	return sum(recent_scores) / len(recent_scores)
-
+def sliding_window_smooth(history: List[Tuple[float, str]], window_size: int) -> float:
+    """[Module B] 滑动窗口：对实时流进行去噪平滑"""
+    if not history: return 0.0
+    recent = history[-window_size:]
+    scores = [s for s, l in recent]
+    return sum(scores) / len(scores)
 
 def classify_state(score: float, config: PipelineConfig) -> str:
-	"""Map concentration score into qualitative state labels."""
-	if score > config.focused_threshold:
-		return "Focused"
-	if score > config.slight_distracted_threshold:
-		return "Slightly Distracted"
-	return "Distracted"
+    """状态分类逻辑"""
+    if score > config.focused_threshold:
+        return "Focused"
+    if score > config.slight_distracted_threshold:
+        return "Slightly Distracted"
+    return "Distracted"
 
+def rag_llm_feedback(page: str) -> str:
+    """[Module C] RAG + LLM：基于当前页内容的生成式干预"""
+    return f"[AI 튜터] {page} 요약: 몰입도가 낮아졌습니다. 핵심 개념을 다시 요약해 드릴까요?"
 
-def need_intervention(state: str) -> bool:
-	"""Trigger intervention if current state is not focused."""
-	return state != "Focused"
+# --- 3. 教师端模块 (Teacher Side - 纯真实数据驱动) ---
 
+# 模拟服务器端的全局存储（在全栈中这通常是 Redis 或 Database）
+global_class_data = {} 
 
-def rag_llm(page: str) -> str:
-	"""Simulate retrieval-augmented feedback from study material."""
-	return f"[AI 튜터] 현재 {page} 내용의 핵심 요약: 핵심 개념에 유의하고, 먼저 정의를 다시 설명한 후 문제를 풀어보세요."
+def update_server_state(payload: Dict[str, object]):
+    """模拟后端接收 API 请求并更新全局状态"""
+    student_id = payload["student_id"]
+    global_class_data[student_id] = payload
 
+def generate_teacher_report(config: PipelineConfig):
+    """教师端核心分析：仅基于 global_class_data 中的真实在线学生"""
+    if not global_class_data:
+        print("\n[Teacher Dashboard] 대기 중... 접속한 학생이 없습니다.")
+        return
 
-def render_ui(score: float, state: str, feedback: str | None) -> None:
-	"""Console UI output for student-side feedback."""
-	print(f"Focus Score: {score:.2f}")
-	print(f"State: {state}")
-	if feedback:
-		print(f"AI Feedback: {feedback}")
+    page_summary = defaultdict(list)
+    at_risk_students = []
 
+    print("\n" + "="*45)
+    print(f"   [TEACHER REAL-TIME DASHBOARD]")
+    print(f"   현재 접속 학생 수: {len(global_class_data)}명")
+    
+    for s_id, data in global_class_data.items():
+        score = data["focus_score"]
+        page = data["page"]
+        state = classify_state(score, config)
+        
+        # 实时风险监测
+        if score <= config.slight_distracted_threshold:
+            at_risk_students.append(f"{s_id}({state})")
+        
+        page_summary[page].append(score)
+        print(f"   - 학생[{s_id}]: 점수 {score:.2f} | 상태 {state}")
 
-def send_to_teacher(score: float, state: str, config: PipelineConfig) -> Dict[str, object]:
-	"""Build and print payload that would be sent to teacher dashboard."""
-	payload = {
-		"student_id": config.student_id,
-		"page": 10,
-		"focus_score": round(score, 2),
-		"state": state,
-	}
-	print(f"Send to teacher: {payload}")
-	return payload
+    # 动态热力图计算
+    print(f"\n   [페이지별 히트맵 분석]")
+    for page, scores in page_summary.items():
+        avg = sum(scores) / len(scores)
+        color = "Green(수월)" if avg > config.focused_threshold else ("Yellow(보통)" if avg > config.slight_distracted_threshold else "Red(어려움)")
+        print(f"     Page {page}: 평균 {avg:.2f} -> 상태: {color}")
 
+    if at_risk_students:
+        print(f"\n   ⚠️ 집중도 저하 학생: {at_risk_students}")
+    print("="*45)
 
-def receive_student_data(student_payload: Dict[str, object]) -> List[Dict[str, object]]:
-	"""Simulate teacher-side API intake by combining one real payload with peers."""
-	data = [
-		{
-			"student_id": student_payload["student_id"],
-			"page": student_payload.get("page", 10),
-			"score": float(student_payload["focus_score"]),
-		},
-		{"student_id": "A02", "page": 10, "score": 0.82},
-		{"student_id": "A03", "page": 10, "score": 0.45},
-	]
-	return data
+# --- 4. 主程序：全链路实时循环 ---
 
+def main():
+    config = PipelineConfig()
+    cap = cv2.VideoCapture(0)
+    
+    window_size = config.window_seconds * config.fps
+    predictions_history = []
+    last_sync_time = time.time()
 
-def analyze_students(data: List[Dict[str, object]], config: PipelineConfig) -> List[Dict[str, object]]:
-	"""Assign per-student focus state based on score thresholds."""
-	processed: List[Dict[str, object]] = []
-	for student in data:
-		score = float(student["score"])
-		if score > config.focused_threshold:
-			state = "Focused"
-		elif score > config.slight_distracted_threshold:
-			state = "Slightly Distracted"
-		else:
-			state = "Distracted"
+    print(f"시스템 초기화 완료. 학생 ID: {config.student_id}")
 
-		item = dict(student)
-		item["state"] = state
-		processed.append(item)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
 
-	return processed
+        # 1. 实时感知 (Module A)
+        score, label = get_vit_prediction(frame)
+        predictions_history.append((score, label))
+        if len(predictions_history) > window_size:
+            predictions_history.pop(0)
 
+        # 2. 数据平滑 (Module B)
+        smooth_score = sliding_window_smooth(predictions_history, window_size)
+        state = classify_state(smooth_score, config)
 
-def generate_heatmap(data: List[Dict[str, object]], config: PipelineConfig) -> Dict[int, Dict[str, Any]]:
-	"""Aggregate concentration per page and convert into heatmap colors."""
-	page_scores: Dict[int, List[float]] = defaultdict(list)
-	for student in data:
-		page = int(student["page"])
-		score = float(student["score"])
-		page_scores[page].append(score)
+        # 3. 学生端 UI 表现
+        ui_color = (0, 255, 0) if state == "Focused" else ((0, 255, 255) if state == "Slightly Distracted" else (0, 0, 255))
+        
+        cv2.rectangle(frame, (15, 15), (420, 140), (0, 0, 0), -1)
+        cv2.putText(frame, f"REAL-TIME MONITOR: {config.student_id}", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"SCORE: {smooth_score:.2f}", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, ui_color, 2)
+        cv2.putText(frame, f"STATE: {state}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ui_color, 2)
+        
+        if state == "Distracted":
+            cv2.putText(frame, "AI HELP ACTIVE", (30, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 150, 0), 2)
 
-	heatmap: Dict[int, Dict[str, Any]] = {}
-	for page, scores in page_scores.items():
-		avg_score = sum(scores) / len(scores)
-		if avg_score > config.focused_threshold:
-			color = "Green"
-		elif avg_score > config.slight_distracted_threshold:
-			color = "Yellow"
-		else:
-			color = "Red"
+        cv2.imshow('Student Interface', frame)
 
-		heatmap[page] = {"avg_score": round(avg_score, 2), "color": color}
+        # 4. 真实同步逻辑 (Module B -> Module C / Teacher)
+        # 只有到达同步间隔时，才将“我”的数据发给“服务器”并触发教师端更新
+        if time.time() - last_sync_time > config.sync_interval:
+            my_payload = {
+                "student_id": config.student_id,
+                "page": 10,
+                "focus_score": smooth_score,
+                "timestamp": time.time()
+            }
+            # 更新全局状态（模拟真实数据库写入）
+            update_server_state(my_payload)
+            # 触发教师端分析逻辑
+            generate_teacher_report(config)
+            last_sync_time = time.time()
 
-	return heatmap
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-
-def detect_at_risk_students(data: List[Dict[str, object]], config: PipelineConfig) -> List[str]:
-	"""Return IDs of students below the distraction cutoff."""
-	return [
-		str(student["student_id"])
-		for student in data
-		if float(student["score"]) <= config.slight_distracted_threshold
-	]
-
-
-def render_dashboard(
-	data: List[Dict[str, object]],
-	heatmap: Dict[int, Dict[str, Any]],
-	warnings: List[str],
-) -> None:
-	"""Console dashboard for teacher-side monitoring."""
-	print("\n=== Teacher Dashboard ===")
-
-	print("\n[Student Status]")
-	for student in data:
-		print(student)
-
-	print("\n[Heatmap]")
-	for page, info in sorted(heatmap.items()):
-		print(f"Page {page}: {info}")
-
-	print("\n[Warning Students]")
-	print(warnings)
-
-
-def teacher_main(student_payload: Dict[str, object], config: PipelineConfig) -> None:
-	"""Run end-to-end teacher pipeline using uploaded student results."""
-	raw_data = receive_student_data(student_payload)
-	processed = analyze_students(raw_data, config)
-	heatmap = generate_heatmap(processed, config)
-	warnings = detect_at_risk_students(processed, config)
-	render_dashboard(processed, heatmap, warnings)
-
-
-def main() -> None:
-	config = PipelineConfig()
-	random.seed(config.random_seed)
-
-	print("=== Learning Concentration System Dry Run ===")
-
-	frames = collect_video_frames(config)
-	predictions = run_vit_model(frames)
-
-	window_size = config.window_seconds * config.fps
-	focus_score = sliding_window(predictions, window_size=window_size)
-	state = classify_state(focus_score, config)
-
-	feedback = rag_llm(config.rag_page) if need_intervention(state) else None
-
-	render_ui(focus_score, state, feedback)
-	student_payload = send_to_teacher(focus_score, state, config)
-	teacher_main(student_payload, config)
-
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-	main()
+    main()
