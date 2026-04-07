@@ -1,0 +1,6 @@
+name: mlc_python
+dependencies:
+  flutter:
+    sdk: flutter
+  percent_indicator: ^4.2.3  # 用于美化专注环
+  http: ^1.1.0               # 之后连接 Python 后端用

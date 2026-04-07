@@ -1,0 +1,15 @@
+name: mlc
+description: Measuring Learning Concentration Flutter App
+version: 1.0.0+1
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  percent_indicator: ^4.2.3  # 用于美化专注环
+  http: ^1.1.0               # 之后连接 Python 后端用
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true
