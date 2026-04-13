@@ -8,8 +8,18 @@ dependencies:
     sdk: flutter
   percent_indicator: ^4.2.3  # 用于美化专注环
   http: ^1.1.0               # 之后连接 Python 后端用
+  fl_chart: ^0.66.0          # 用于绘制图表
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1
 flutter:
   uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/logo.png"
+  adaptive_icon_background: "#102C57" 
+  adaptive_icon_foreground: "assets/logo.png"
