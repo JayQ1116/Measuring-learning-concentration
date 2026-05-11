@@ -1,9 +1,38 @@
 from __future__ import annotations
 
 import cv2
+import numpy as np
 from typing import Optional
 
 from ...config import PipelineConfig
+
+
+def draw_prediction(frame: np.ndarray, box: tuple[int, int, int, int], pred: np.ndarray) -> None:
+    x, y, w, h = box
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    p = pred.flatten()
+    top_line = f"Eng:{p[0]:.2f} Bor:{p[1]:.2f}"
+    bottom_line = f"Con:{p[2]:.2f} Fru:{p[3]:.2f}"
+
+    cv2.putText(
+        frame,
+        top_line,
+        (x, max(20, y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (36, 255, 12),
+        2,
+    )
+    cv2.putText(
+        frame,
+        bottom_line,
+        (x, y + h + 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (36, 255, 12),
+        2,
+    )
 
 
 def draw_student_ui(frame, config: PipelineConfig, smooth_score: float, state: str) -> None:

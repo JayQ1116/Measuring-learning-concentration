@@ -1,17 +1,216 @@
-<html>
+<!DOCTYPE html>
+<html lang="en">
   <head>
-    <title>Engagement recognition</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DAISEE Live View</title>
     <style>
-	img {
-  	display: block;
-  	margin-left: auto;
-  	margin-right: auto;
-	width: 35%
-	}
+      body {
+        margin: 0;
+        font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        min-height: 100vh;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 20px;
+        padding: 24px;
+        min-height: 100vh;
+        box-sizing: border-box;
+      }
+
+      .card {
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: 22px;
+        font-weight: 600;
+      }
+
+      p {
+        margin: 0 0 16px;
+        color: #94a3b8;
+      }
+
+      img {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #1f2937;
+        background: #0b1120;
+      }
+
+      .pdf-toolbar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      .pdf-toolbar button {
+        background: #1e293b;
+        color: #e2e8f0;
+        border: 1px solid #334155;
+        padding: 8px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+
+      .pdf-toolbar input {
+        width: 72px;
+        background: #0b1120;
+        border: 1px solid #334155;
+        color: #e2e8f0;
+        border-radius: 8px;
+        padding: 6px 8px;
+      }
+
+      .pdf-toolbar .status {
+        color: #94a3b8;
+        font-size: 14px;
+      }
+
+      iframe {
+        width: 100%;
+        height: 100%;
+        min-height: 420px;
+        border-radius: 8px;
+        border: 1px solid #1f2937;
+        background: #0b1120;
+      }
+
+      .qa {
+        margin-top: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .qa textarea {
+        width: 100%;
+        min-height: 90px;
+        background: #0b1120;
+        color: #e2e8f0;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 8px;
+        resize: vertical;
+      }
+
+      .qa button {
+        align-self: flex-start;
+        background: #2563eb;
+        color: #f8fafc;
+        border: 0;
+        border-radius: 8px;
+        padding: 8px 14px;
+        cursor: pointer;
+      }
+
+      .qa .answer {
+        white-space: pre-wrap;
+        background: #0b1120;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 10px;
+        min-height: 48px;
+        color: #e2e8f0;
+      }
+
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
-    <h1 align="center">Video Streaming Demonstration</h1>
-    <img id="bg" class="center" src="{{ url_for('video_feed') }}">
+    <div class="layout">
+      <div class="card">
+        <h1>DAISEE Live View</h1>
+        <p>Streaming from the local camera. If the frame is blank, refresh the page.</p>
+        <img src="/video_feed" alt="Live video stream" />
+      </div>
+      <div class="card">
+        <h1>Courseware PDF</h1>
+        <div class="pdf-toolbar">
+          <button type="button" onclick="changePage(-1)">Prev</button>
+          <button type="button" onclick="changePage(1)">Next</button>
+          <input id="pageInput" type="number" min="1" value="{{ pdf_page }}" />
+          <button type="button" onclick="goToPage()">Go</button>
+          <span class="status">Page <span id="pageLabel">{{ pdf_page }}</span></span>
+        </div>
+        <iframe id="pdfFrame" src="/pdf#page={{ pdf_page }}" title="Courseware PDF"></iframe>
+        <div class="qa">
+          <label for="questionInput">Ask a question</label>
+          <label><input id="usePage" type="checkbox" checked /> Use current PDF page</label>
+          <textarea id="questionInput" placeholder="Type your question..."></textarea>
+          <button type="button" onclick="askQuestion()">Ask</button>
+          <div id="answerBox" class="answer"></div>
+        </div>
+      </div>
+    </div>
+    <script>
+      const pageLabel = document.getElementById("pageLabel");
+      const pageInput = document.getElementById("pageInput");
+      const pdfFrame = document.getElementById("pdfFrame");
+      const usePage = document.getElementById("usePage");
+
+      function setPage(page) {
+        const nextPage = Math.max(1, Number(page) || 1);
+        pageInput.value = nextPage;
+        pageLabel.textContent = nextPage;
+        pdfFrame.src = `/pdf?ts=${Date.now()}#page=${nextPage}`;
+        fetch(`/set_page?page=${nextPage}`);
+      }
+
+      function changePage(delta) {
+        setPage((Number(pageInput.value) || 1) + delta);
+      }
+
+      function goToPage() {
+        setPage(pageInput.value);
+      }
+
+      let activeStream = null;
+      function askQuestion() {
+        const answerBox = document.getElementById("answerBox");
+        const question = document.getElementById("questionInput").value.trim();
+        if (!question) {
+          answerBox.textContent = "Please enter a question.";
+          return;
+        }
+        if (activeStream) {
+          activeStream.close();
+        }
+        answerBox.textContent = "";
+        const page = Number(pageInput.value) || 1;
+        const includePage = usePage.checked ? 1 : 0;
+        const url = `/ask_stream?question=${encodeURIComponent(
+          question
+        )}&page=${page}&include_page=${includePage}`;
+        const stream = new EventSource(url);
+        activeStream = stream;
+        stream.onmessage = (evt) => {
+          if (evt.data === "[DONE]") {
+            stream.close();
+            return;
+          }
+          answerBox.textContent += evt.data;
+        };
+        stream.onerror = () => {
+          answerBox.textContent += "\n[stream error]";
+          stream.close();
+        };
+      }
+    </script>
   </body>
 </html>

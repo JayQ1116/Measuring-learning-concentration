@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import cv2
@@ -93,3 +94,18 @@ class PdfCoursewareViewer:
             2,
         )
         return img
+
+
+def render_pdf_page(pdf_path: str, page: int) -> bytes:
+    try:
+        from pdf2image import convert_from_path
+    except ImportError as exc:
+        raise RuntimeError("pdf2image is required for PDF screenshots") from exc
+
+    images = convert_from_path(pdf_path, first_page=page, last_page=page)
+    if not images:
+        raise RuntimeError("Failed to render PDF page")
+
+    buffer = BytesIO()
+    images[0].save(buffer, format="PNG")
+    return buffer.getvalue()

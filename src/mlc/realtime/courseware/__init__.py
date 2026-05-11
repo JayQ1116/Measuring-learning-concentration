@@ -1,3 +1,3 @@
-from .pdf_viewer import PdfCoursewareViewer
+from .pdf_viewer import PdfCoursewareViewer, render_pdf_page
 
-__all__ = ["PdfCoursewareViewer"]
+__all__ = ["PdfCoursewareViewer", "render_pdf_page"]
