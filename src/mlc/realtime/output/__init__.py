@@ -1,4 +1,4 @@
-from .data_output import build_teacher_payload
+from .data_output import CsvWindowAverager, build_teacher_payload
 from .ui_output import (
     draw_student_ui,
     init_student_window,
@@ -10,6 +10,7 @@ from .ui_output import (
 
 __all__ = [
     "build_teacher_payload",
+    "CsvWindowAverager",
     "draw_student_ui",
     "init_student_window",
     "read_key",

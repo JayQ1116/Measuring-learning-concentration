@@ -21,7 +21,7 @@ class PipelineConfig:
     prev_page_key: str = "p"
     toggle_window_key: str = "m"
     toggle_topmost_key: str = "t"
-    pdf_path: str = "assets/pdf/lesson1.pdf"
+    pdf_path: str = "src/mlc/realtime/pdf/courseware.pdf"
     pdf_window_name: str = "Courseware PDF"
     compact_width: int = 520
     compact_height: int = 300
@@ -29,3 +29,5 @@ class PipelineConfig:
     maximized_height: int = 720
     student_window_topmost: bool = True
     confusion_high_threshold: int = 2
+    csv_path: str = "outputs/engagement_metrics.csv"
+    csv_window_seconds: float = 5.0
