@@ -4,18 +4,19 @@ import csv
 import datetime
 import os
 import time
+from io import BytesIO
 from collections import defaultdict
 from typing import Any, Iterable, Tuple
 
 import cv2
 import numpy as np
-from flask import Flask, Response, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 
 try:
     from mlc.config import PipelineConfig
-    from mlc.realtime.assistant import ask_learning_llm
     from mlc.realtime.courseware import PdfCoursewareViewer
     from mlc.realtime.input import close_camera, open_camera, read_camera_frame
+    from mlc.realtime.llm.llm import StudentQuestionHandler
     from mlc.realtime.model import (
         detect_faces_yolo,
         classify_state,
@@ -46,9 +47,9 @@ except ImportError:
         sys.path.insert(0, SRC_DIR)
 
     from mlc.config import PipelineConfig
-    from mlc.realtime.assistant import ask_learning_llm
     from mlc.realtime.courseware import PdfCoursewareViewer
     from mlc.realtime.input import close_camera, open_camera, read_camera_frame
+    from mlc.realtime.llm.llm import StudentQuestionHandler
     from mlc.realtime.model import (
         detect_faces_yolo,
         classify_state,
@@ -149,8 +150,15 @@ def build_index_html(pdf_page: int) -> str:
         ".pdf-toolbar input{width:72px;background:#0b1120;border:1px solid #334155;"
         "color:#e2e8f0;border-radius:8px;padding:6px 8px;}"
         ".pdf-toolbar .status{color:#94a3b8;font-size:14px;}"
-        "iframe{width:100%;height:100%;min-height:480px;border-radius:8px;"
+        "iframe{width:100%;height:100%;min-height:420px;border-radius:8px;"
         "border:1px solid #1f2937;background:#0b1120;}"
+        ".qa{margin-top:16px;display:flex;flex-direction:column;gap:10px;}"
+        ".qa textarea{width:100%;min-height:90px;background:#0b1120;color:#e2e8f0;"
+        "border:1px solid #334155;border-radius:8px;padding:8px;resize:vertical;}"
+        ".qa button{align-self:flex-start;background:#2563eb;color:#f8fafc;"
+        "border:0;border-radius:8px;padding:8px 14px;cursor:pointer;}"
+        ".qa .answer{white-space:pre-wrap;background:#0b1120;border:1px solid #334155;"
+        "border-radius:8px;padding:10px;min-height:48px;color:#e2e8f0;}"
         "@media (max-width: 980px){.layout{grid-template-columns:1fr;}}"
         "</style>"
         "</head>"
@@ -171,12 +179,20 @@ def build_index_html(pdf_page: int) -> str:
         f"<span class=\"status\">Page <span id=\"pageLabel\">{pdf_page}</span></span>"
         "</div>"
         f"<iframe id=\"pdfFrame\" src=\"/pdf#page={pdf_page}\" title=\"Courseware PDF\"></iframe>"
+        "<div class=\"qa\">"
+        "<label for=\"questionInput\">Ask a question</label>"
+        "<label><input id=\"usePage\" type=\"checkbox\" checked /> Use current PDF page</label>"
+        "<textarea id=\"questionInput\" placeholder=\"Type your question...\"></textarea>"
+        "<button type=\"button\" onclick=\"askQuestion()\">Ask</button>"
+        "<div id=\"answerBox\" class=\"answer\"></div>"
+        "</div>"
         "</div>"
         "</div>"
         "<script>"
         "const pageLabel = document.getElementById('pageLabel');"
         "const pageInput = document.getElementById('pageInput');"
         "const pdfFrame = document.getElementById('pdfFrame');"
+        "const usePage = document.getElementById('usePage');"
         "function setPage(page){"
         "const nextPage = Math.max(1, Number(page) || 1);"
         "pageInput.value = nextPage;"
@@ -190,10 +206,46 @@ def build_index_html(pdf_page: int) -> str:
         "function goToPage(){"
         "setPage(pageInput.value);"
         "}"
+        "let activeStream = null;"
+        "function askQuestion(){"
+        "const answerBox = document.getElementById('answerBox');"
+        "const question = document.getElementById('questionInput').value.trim();"
+        "if(!question){answerBox.textContent = 'Please enter a question.';return;}"
+        "if(activeStream){activeStream.close();}"
+        "answerBox.textContent = '';"
+        "const page = Number(pageInput.value) || 1;"
+        "const includePage = usePage.checked ? 1 : 0;"
+        "const url = `/ask_stream?question=${encodeURIComponent(question)}&page=${page}&include_page=${includePage}`;"
+        "const stream = new EventSource(url);"
+        "activeStream = stream;"
+        "stream.onmessage = (evt) => {"
+        "if(evt.data === '[DONE]'){stream.close();return;}"
+        "answerBox.textContent += evt.data;"
+        "};"
+        "stream.onerror = () => {"
+        "answerBox.textContent += '\n[stream error]';"
+        "stream.close();"
+        "};"
+        "}"
         "</script>"
         "</body>"
         "</html>"
     )
+
+
+def render_pdf_page(pdf_path: str, page: int) -> bytes:
+    try:
+        from pdf2image import convert_from_path
+    except ImportError as exc:
+        raise RuntimeError("pdf2image is required for PDF screenshots") from exc
+
+    images = convert_from_path(pdf_path, first_page=page, last_page=page)
+    if not images:
+        raise RuntimeError("Failed to render PDF page")
+
+    buffer = BytesIO()
+    images[0].save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def iter_frames(
@@ -318,6 +370,7 @@ def run_student_camera_loop(config: PipelineConfig | None = None) -> None:
     topmost = config.student_window_topmost
 
     init_student_window(config)
+    llm_handler = StudentQuestionHandler()
     csv_averager = CsvWindowAverager(config.csv_path, config.csv_window_seconds)
 
     pdf_viewer = PdfCoursewareViewer(config.pdf_path, config.pdf_window_name)
@@ -382,7 +435,7 @@ def run_student_camera_loop(config: PipelineConfig | None = None) -> None:
             if key == config.ask_llm_key:
                 question = input("\n[LLM] Ask your question: ").strip()
                 if question:
-                    response = ask_learning_llm(question, config.current_page, state)
+                    response = llm_handler.handle(question, config.current_page, state)
                     print(response)
                     confusion_counts[config.current_page] += 1
             if key == config.next_page_key:
@@ -423,6 +476,7 @@ def create_app() -> Flask:
         pdf_path = os.path.join(base_dir, pdf_path)
 
     page_state = {"page": PDF_PAGE_DEFAULT}
+    llm_handler = StudentQuestionHandler()
 
     app = Flask(__name__)
 
@@ -436,6 +490,48 @@ def create_app() -> Flask:
         if page is not None and page > 0:
             page_state["page"] = page
         return "ok"
+
+    @app.route("/ask_stream")
+    def ask_stream():
+        question = request.args.get("question", "").strip()
+        page = request.args.get("page", type=int)
+        include_page = request.args.get("include_page", "1") == "1"
+        if not question:
+            return Response("data: Question is required.\n\n", mimetype="text/event-stream")
+
+        if page is None or page < 1:
+            page = page_state.get("page", PDF_PAGE_DEFAULT)
+
+        if not include_page:
+            page = 0
+
+        try:
+            image_bytes = render_pdf_page(pdf_path, page) if include_page else None
+        except Exception as exc:
+            return Response(
+                f"data: {str(exc)}\n\ndata: [DONE]\n\n",
+                mimetype="text/event-stream",
+            )
+
+        def generate():
+            try:
+                for chunk in llm_handler.stream_with_image(
+                    question,
+                    page,
+                    "Web",
+                    image_bytes,
+                ):
+                    for line in chunk.splitlines() or [""]:
+                        yield f"data: {line}\n\n"
+            except Exception as exc:
+                yield f"data: {str(exc)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return Response(generate(), headers=headers, mimetype="text/event-stream")
 
     @app.route("/pdf")
     def pdf():
