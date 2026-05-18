@@ -1,6 +1,6 @@
 // lib/pages/dashboard_page.dart
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../app_theme.dart';
 import 'course_list_page.dart';
@@ -38,7 +38,7 @@ class StudentDashboard extends StatelessWidget {
         actions: [
           TextButton.icon(
             onPressed: () async {
-              await FirebaseAuth.instance.signOut();
+              await Supabase.instance.client.auth.signOut();
               if (context.mounted) {
                 Navigator.of(context).pushAndRemoveUntil(
                   MaterialPageRoute(builder: (_) => const LoginPage()),

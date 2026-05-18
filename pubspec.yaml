@@ -19,6 +19,7 @@ dependencies:
   camera: ^0.10.5+9
   file_selector: ^1.1.0
   google_generative_ai: ^0.4.6
+  supabase_flutter: ^2.5.1
 
   # Firebase 升级到最新
   firebase_core: ^3.6.0

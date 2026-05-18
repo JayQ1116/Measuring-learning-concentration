@@ -1,9 +1,5 @@
-// lib/pages/login_page.dart
-// 完整版：Firebase Auth 注册 + 登录
-
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'dashboard_page.dart';
 import 'teacher_dashboard_page.dart';
@@ -47,19 +43,58 @@ class _LoginPageState extends State<LoginPage> {
 
     setState(() => _loading = true);
     try {
-      final cred = await FirebaseAuth.instance
-          .signInWithEmailAndPassword(email: email, password: pw);
+      final supabase = Supabase.instance.client;
+      final res = await supabase.auth.signInWithPassword(
+        email: email,
+        password: pw,
+      );
+      final user = res.user;
+      if (user == null) {
+        _showSnack('로그인 실패: 사용자 정보를 불러올 수 없습니다');
+        return;
+      }
 
-      final uid = cred.user!.uid;
-      final doc = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(uid)
-          .get();
+      String role = 'Student';
+      String displayName = email;
+      final metadata = user.userMetadata ?? {};
+
+      final teacher = await supabase
+          .from('teachers')
+          .select('id,name')
+          .eq('id', user.id)
+          .maybeSingle();
+      if (teacher != null) {
+        role = 'Teacher';
+        displayName = (teacher['name'] as String?) ?? email;
+      } else {
+        final student = await supabase
+            .from('students')
+            .select('id,name')
+            .eq('id', user.id)
+            .maybeSingle();
+        if (student != null) {
+          displayName = (student['name'] as String?) ?? email;
+        } else if (metadata.isNotEmpty) {
+          final metaRole = metadata['role'] as String?;
+          final metaName = metadata['name'] as String?;
+          role = (metaRole == 'Teacher' || metaRole == 'Student') ? metaRole! : 'Student';
+          displayName = metaName ?? email;
+          if (role == 'Teacher') {
+            await supabase.from('teachers').upsert({
+              'id': user.id,
+              'name': displayName,
+              'email': email,
+            });
+          } else {
+            await supabase.from('students').upsert({
+              'id': user.id,
+              'name': displayName,
+            });
+          }
+        }
+      }
 
       if (!mounted) return;
-
-      final role = doc.data()?['role'] ?? 'Student';
-      final name = doc.data()?['name'] ?? email;
 
       if (role == 'Teacher') {
         Navigator.pushReplacement(
@@ -72,12 +107,12 @@ class _LoginPageState extends State<LoginPage> {
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
-            builder: (_) => StudentDashboard(studentId: uid, studentName: name),
+            builder: (_) => StudentDashboard(studentId: user.id, studentName: displayName),
           ),
         );
       }
-    } on FirebaseAuthException catch (e) {
-      _showSnack(_authError(e.code));
+    } on AuthException catch (e) {
+      _showSnack(_authError(e.message));
     } catch (e) {
       _showSnack('로그인 실패: $e');
     } finally {
@@ -104,24 +139,43 @@ class _LoginPageState extends State<LoginPage> {
 
     setState(() => _loading = true);
     try {
-      final cred = await FirebaseAuth.instance
-          .createUserWithEmailAndPassword(email: email, password: pw);
+      final supabase = Supabase.instance.client;
+      final res = await supabase.auth.signUp(
+        email: email,
+        password: pw,
+        data: {
+          'name': name,
+          'role': _role,
+        },
+      );
+      final user = res.user;
+      if (user == null) {
+        _showSnack('회원가입 실패: 사용자 정보를 불러올 수 없습니다');
+        return;
+      }
+      if (res.session == null) {
+        _showSnack('이메일 인증 후 로그인해주세요');
+        return;
+      }
 
-      final uid = cred.user!.uid;
-      await FirebaseFirestore.instance.collection('users').doc(uid).set({
-        'uid': uid,
-        'name': name,
-        'email': email,
-        'role': _role,
-        'classId': 'class_001',
-        'createdAt': FieldValue.serverTimestamp(),
-      });
+      if (_role == 'Teacher') {
+        await supabase.from('teachers').upsert({
+          'id': user.id,
+          'name': name,
+          'email': email,
+        });
+      } else {
+        await supabase.from('students').upsert({
+          'id': user.id,
+          'name': name,
+        });
+      }
 
       if (!mounted) return;
       _showSnack('회원가입 성공! 로그인하세요');
       setState(() => _mode = 'login');
-    } on FirebaseAuthException catch (e) {
-      _showSnack(_authError(e.code));
+    } on AuthException catch (e) {
+      _showSnack(_authError(e.message));
     } catch (e) {
       _showSnack('회원가입 실패: $e');
     } finally {
@@ -129,23 +183,21 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  String _authError(String code) {
-    switch (code) {
-      case 'user-not-found':
-        return '존재하지 않는 계정입니다';
-      case 'wrong-password':
-        return '비밀번호가 틀렸습니다';
-      case 'email-already-in-use':
-        return '이미 사용 중인 이메일입니다';
-      case 'invalid-email':
-        return '이메일 형식이 올바르지 않습니다';
-      case 'weak-password':
-        return '비밀번호가 너무 짧습니다';
-      case 'invalid-credential':
-        return '이메일 또는 비밀번호가 틀렸습니다';
-      default:
-        return '오류: $code';
+  String _authError(String message) {
+    final msg = message.toLowerCase();
+    if (msg.contains('invalid login credentials')) {
+      return '이메일 또는 비밀번호가 틀렸습니다';
     }
+    if (msg.contains('user already registered')) {
+      return '이미 사용 중인 이메일입니다';
+    }
+    if (msg.contains('invalid email')) {
+      return '이메일 형식이 올바르지 않습니다';
+    }
+    if (msg.contains('password')) {
+      return '비밀번호를 확인해주세요';
+    }
+    return '오류: $message';
   }
 
   void _showSnack(String msg) {
