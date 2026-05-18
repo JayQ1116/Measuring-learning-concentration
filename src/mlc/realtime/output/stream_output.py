@@ -4,10 +4,16 @@ import csv
 import datetime
 import os
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import cv2
 import numpy as np
+
+try:
+    from supabase import Client, create_client
+except ImportError:  # pragma: no cover - optional dependency
+    Client = None
+    create_client = None
 
 from ..input import close_camera, open_camera, read_camera_frame
 from ..model import detect_faces_yolo, predict_emotions, preprocess_face
@@ -24,30 +30,48 @@ def iter_frames(
     csv_window_sec: float,
     pdf_name: str,
     default_page: int,
+    supabase_url: str,
+    supabase_key: str,
+    student_id: str,
+    student_name: str,
     img_size: tuple[int, int],
     yolo_confidence: float,
     yolo_iou: float,
     camera_index: int,
 ) -> Iterable[bytes]:
-    csv_dir = os.path.dirname(csv_path)
-    if csv_dir:
-        os.makedirs(csv_dir, exist_ok=True)
+    supabase_client: Optional["Client"] = None
+    if supabase_url and supabase_key and create_client is not None and student_id:
+        try:
+            supabase_client = create_client(supabase_url, supabase_key)
+            supabase_client.table("students").upsert({
+                "id": student_id,
+                "name": student_name or "신규림",
+            }).execute()
+        except Exception:
+            supabase_client = None
 
-    csv_exists = os.path.exists(csv_path)
-    csv_file = open(csv_path, "a", newline="", encoding="utf-8")
-    writer = csv.writer(csv_file)
-    if not csv_exists:
-        writer.writerow([
-            "timestamp",
-            "engagement",
-            "boredom",
-            "confusion",
-            "frustration",
-            "samples",
-            "pdf_page",
-            "pdf_name",
-        ])
-        csv_file.flush()
+    csv_file = None
+    writer = None
+    if supabase_client is None:
+        csv_dir = os.path.dirname(csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+
+        csv_exists = os.path.exists(csv_path)
+        csv_file = open(csv_path, "a", newline="", encoding="utf-8")
+        writer = csv.writer(csv_file)
+        if not csv_exists:
+            writer.writerow([
+                "timestamp",
+                "engagement",
+                "boredom",
+                "confusion",
+                "frustration",
+                "samples",
+                "pdf_page",
+                "pdf_name",
+            ])
+            csv_file.flush()
 
     window_start = time.time()
     window_preds: list[np.ndarray] = []
@@ -95,17 +119,30 @@ def iter_frames(
                     avg = np.mean(window_preds, axis=0)
                     kst = datetime.timezone(datetime.timedelta(hours=9))
                     timestamp = datetime.datetime.now(kst).replace(microsecond=0).isoformat()
-                    writer.writerow([
-                        timestamp,
-                        f"{avg[0]:.6f}",
-                        f"{avg[1]:.6f}",
-                        f"{avg[2]:.6f}",
-                        f"{avg[3]:.6f}",
-                        str(len(window_preds)),
-                        str(page_state.get("page", default_page)),
-                        pdf_name,
-                    ])
-                    csv_file.flush()
+                    if supabase_client is not None:
+                        supabase_client.table("engagement_metrics").insert({
+                            "student_id": student_id,
+                            "timestamp": timestamp,
+                            "engagement": float(avg[0]),
+                            "boredom": float(avg[1]),
+                            "confusion": float(avg[2]),
+                            "frustration": float(avg[3]),
+                            "samples": int(len(window_preds)),
+                            "pdf_page": int(page_state.get("page", default_page)),
+                            "pdf_name": pdf_name,
+                        }).execute()
+                    elif writer is not None and csv_file is not None:
+                        writer.writerow([
+                            timestamp,
+                            f"{avg[0]:.6f}",
+                            f"{avg[1]:.6f}",
+                            f"{avg[2]:.6f}",
+                            f"{avg[3]:.6f}",
+                            str(len(window_preds)),
+                            str(page_state.get("page", default_page)),
+                            pdf_name,
+                        ])
+                        csv_file.flush()
                 window_start = now
                 window_preds = []
 
@@ -118,4 +155,5 @@ def iter_frames(
                 b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n\r\n"
             )
     finally:
-        csv_file.close()
+        if csv_file is not None:
+            csv_file.close()

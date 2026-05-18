@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
 from ..config import PipelineConfig
 
 MODEL_PATH = os.environ.get(
@@ -26,3 +34,7 @@ DEFAULT_PDF_PATH = PipelineConfig().pdf_path
 PDF_PATH = os.environ.get("DAISEE_PDF_PATH", DEFAULT_PDF_PATH)
 PDF_PAGE_DEFAULT = int(os.environ.get("DAISEE_PDF_PAGE", str(PipelineConfig().current_page)))
 PDF_NAME = os.path.basename(PDF_PATH)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", os.environ.get("SUPABASE_KEY", ""))
+SUPABASE_STUDENT_ID = os.environ.get("SUPABASE_STUDENT_ID", "")
+SUPABASE_STUDENT_NAME = os.environ.get("SUPABASE_STUDENT_NAME", "신규림")
