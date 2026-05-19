@@ -1,19 +1,19 @@
 // lib/pages/learning_page.dart
+// Web + iOS/Android 모두 지원 + 교사 업로드 PDF 자동 로드
+
 import 'dart:async';
 import 'dart:convert';
+// ignore: avoid_web_libraries_in_flutter
+import 'dart:html' as html;
 
-import 'package:camera/camera.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_pdfview/flutter_pdfview.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:http/http.dart' as http;
 import 'package:percent_indicator/circular_percent_indicator.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:image/image.dart' as img;
+// ignore: undefined_prefixed_name
+import 'dart:ui_web' as ui_web;
 
-import '../service/firebase_service.dart';
 import 'report_page.dart';
 
 // ── 설정 ──────────────────────────────────────
@@ -23,45 +23,39 @@ const String _kFlaskBaseUrl = 'http://192.168.200.191:5001';
 class StudentLearningPage extends StatefulWidget {
   final String courseName;
   final String studentId;
+  final String? pdfUrl; // ← 교사가 올린 PDF URL
 
   const StudentLearningPage({
     super.key,
     required this.courseName,
     required this.studentId,
+    this.pdfUrl,
   });
 
   @override
   State<StudentLearningPage> createState() => _StudentLearningPageState();
 }
 
-class _StudentLearningPageState extends State<StudentLearningPage>
-    with WidgetsBindingObserver {
+class _StudentLearningPageState extends State<StudentLearningPage> {
 
   // PDF
-  String? _pdfPath;
-  int _currentPage = 0;
-  int _totalPages = 0;
-  PDFViewController? _pdfController;
-  bool _pdfLoading = false;
+  String? _pdfUrl;
+  String? _pdfName;
 
-  // 카메라
-  CameraController? _cameraCtrl;
+  // 웹 카메라
+  html.VideoElement? _videoElement;
+  html.MediaStream? _mediaStream;
   bool _cameraReady = false;
   bool _useRealInference = false;
-  bool _cameraPermissionDenied = false;
-  bool _cameraPermissionPermanentlyDenied = false;
-  bool _cameraPermissionDialogVisible = false;
   bool _isProcessingFrame = false;
   int _lastInferenceTime = 0;
+  Timer? _inferenceTimer;
 
   // 전문도
   double _focusScore = 0.85;
   bool _showAiBubble = false;
   int _focusedSec = 0;
   int _confusedSec = 0;
-
-  // Firebase
-  String? _sessionId;
 
   // Gemini
   late final GenerativeModel _geminiModel;
@@ -72,7 +66,6 @@ class _StudentLearningPageState extends State<StudentLearningPage>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _geminiModel = GenerativeModel(
       model: 'gemini-2.0-flash',
       apiKey: _kGeminiApiKey,
@@ -82,179 +75,64 @@ class _StudentLearningPageState extends State<StudentLearningPage>
       ),
     );
     _chatSession = _geminiModel.startChat();
+
+    // 교사가 올린 PDF URL 자동 설정
+    if (widget.pdfUrl != null && widget.pdfUrl!.isNotEmpty) {
+      _pdfUrl = widget.pdfUrl;
+      _pdfName = widget.courseName;
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initCamera();
-      _startSession();
+      _initWebCamera();
     });
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    final ctrl = _cameraCtrl;
-    _cameraCtrl = null;
-    _cameraReady = false;
-    try {
-      ctrl?.stopImageStream();
-    } catch (_) {}
-    ctrl?.dispose();
-    _endSession();
+    _inferenceTimer?.cancel();
+    _stopCamera();
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && !_cameraReady) {
-      Future.delayed(const Duration(milliseconds: 250), _initCamera);
-    }
+  void _stopCamera() {
+    _mediaStream?.getTracks().forEach((track) => track.stop());
+    _videoElement?.remove();
+    _mediaStream = null;
+    _videoElement = null;
   }
 
-  // ── Firebase ──────────────────────────────
-  Future<void> _startSession() async {
+  // ── 웹 카메라 초기화 ──────────────────────
+  Future<void> _initWebCamera() async {
     try {
-      _sessionId = await FirebaseService.startSession(
-        studentUid: widget.studentId,
-        pdfName: widget.courseName,
-      );
-    } catch (e) {
-      debugPrint('[Firebase] 세션 시작 실패: $e');
-    }
-  }
+      final stream = await html.window.navigator.mediaDevices!.getUserMedia({
+        'video': {'facingMode': 'user', 'width': 320, 'height': 240},
+        'audio': false,
+      });
 
-  Future<void> _endSession() async {
-    if (_sessionId == null) return;
-    try {
-      await FirebaseService.endSession(
-        _sessionId!,
-        focusedSec: _focusedSec,
-        confusedSec: _confusedSec,
-      );
-    } catch (e) {
-      debugPrint('[Firebase] 세션 종료 실패: $e');
-    }
-  }
+      _mediaStream = stream;
+      _videoElement = html.VideoElement()
+        ..srcObject = stream
+        ..autoplay = true
+        ..muted = true
+        ..style.display = 'none';
 
-  // ── 카메라 ────────────────────────────────
-  Future<void> _initCamera() async {
-    if (!mounted) return;
+      html.document.body!.append(_videoElement!);
+      await Future.delayed(const Duration(milliseconds: 500));
 
-    final status = await Permission.camera.status;
-    debugPrint('[Camera] 권한 초기 상태: $status');
-    if (!mounted) return;
-
-    if (!status.isGranted) {
-      final result = await Permission.camera.request();
-      debugPrint('[Camera] 권한 요청 결과: $result');
-      if (!mounted) return;
-      if (!result.isGranted) {
-        setState(() {
-          _cameraPermissionDenied = true;
-          _cameraPermissionPermanentlyDenied =
-              result.isPermanentlyDenied || result.isRestricted;
-          _cameraReady = false;
-        });
-        _showCameraPermissionDialog(_cameraPermissionPermanentlyDenied);
-        return;
+      if (mounted) {
+        setState(() => _cameraReady = true);
+        debugPrint('[Camera] 웹 카메라 초기화 성공');
       }
-    }
-
-    setState(() {
-      _cameraPermissionDenied = false;
-      _cameraPermissionPermanentlyDenied = false;
-    });
-    await _initializeCamera();
-  }
-
-  Future<void> _initializeCamera() async {
-    try {
-      if (_cameraCtrl != null) {
-        try { await _cameraCtrl!.stopImageStream(); } catch (_) {}
-        await _cameraCtrl!.dispose();
-        _cameraCtrl = null;
-        _cameraReady = false;
-      }
-
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        debugPrint('[Camera] 카메라 없음');
-        return;
-      }
-
-      final front = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
-      );
-
-      final ctrl = CameraController(
-        front,
-        ResolutionPreset.low,
-        enableAudio: false,
-      );
-      await ctrl.initialize();
-
-      if (!mounted) {
-        await ctrl.dispose();
-        return;
-      }
-
-      _cameraCtrl = ctrl;
-      setState(() => _cameraReady = true);
-      debugPrint('[Camera] 초기화 성공');
 
       await _checkFlask();
 
-      // 이미지 스트림으로 실시간 추론 (takePicture 대신)
-      ctrl.startImageStream((CameraImage image) async {
-        if (!_useRealInference) return;
-        if (_isProcessingFrame) return;
-
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - _lastInferenceTime < 5000) return; // 5초 간격
-
-        _isProcessingFrame = true;
-        _lastInferenceTime = now;
-        await _runInferenceFromFrame(image);
-        _isProcessingFrame = false;
-      });
+      _inferenceTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _runWebInference(),
+      );
     } catch (e) {
-      debugPrint('[Camera] 초기화 실패: $e');
+      debugPrint('[Camera] 웹 카메라 초기화 실패: $e');
     }
-  }
-
-  void _showCameraPermissionDialog(bool permanentlyDenied) {
-    if (!mounted || _cameraPermissionDialogVisible) return;
-    _cameraPermissionDialogVisible = true;
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('카메라 권한 필요'),
-        content: Text(permanentlyDenied
-            ? '카메라 권한이 영구적으로 거부되었습니다. 설정에서 허용해주세요.'
-            : '카메라 권한이 필요합니다.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('취소'),
-          ),
-          if (!permanentlyDenied)
-            TextButton(
-              onPressed: () async {
-                Navigator.of(context).pop();
-                await _initCamera();
-              },
-              child: const Text('다시 요청'),
-            ),
-          TextButton(
-            onPressed: () async {
-              Navigator.of(context).pop();
-              await openAppSettings();
-            },
-            child: const Text('설정 열기'),
-          ),
-        ],
-      ),
-    ).then((_) => _cameraPermissionDialogVisible = false);
   }
 
   Future<void> _checkFlask() async {
@@ -271,70 +149,45 @@ class _StudentLearningPageState extends State<StudentLearningPage>
     }
   }
 
-  // ── 이미지 스트림으로 추론 (스크린샷 없음) ──
-  Future<void> _runInferenceFromFrame(CameraImage image) async {
-  try {
-    // YUV420 → JPEG 변환
-    final img.Image? convertedImage = _convertCameraImage(image);
-    if (convertedImage == null) return;
+  // ── 웹 카메라 프레임 캡처 및 추론 ──────────
+  Future<void> _runWebInference() async {
+    if (!_cameraReady || !_useRealInference) return;
+    if (_isProcessingFrame) return;
+    if (_videoElement == null) return;
 
-    final jpegBytes = img.encodeJpg(convertedImage, quality: 80);
-    final b64 = base64Encode(jpegBytes);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastInferenceTime < 5000) return;
 
-    final res = await http.post(
-      Uri.parse('$_kFlaskBaseUrl/infer'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'image': b64, 'page': _currentPage + 1}),
-    ).timeout(const Duration(seconds: 8));
+    _isProcessingFrame = true;
+    _lastInferenceTime = now;
 
-    if (res.statusCode == 200) {
-      final data = jsonDecode(res.body);
-      _applyScore((data['focus_score'] as num).toDouble());
-    }
-  } catch (e) {
-    debugPrint('[Inference] 오류: $e');
-  }
-}
+    try {
+      final canvas = html.CanvasElement(
+        width: _videoElement!.videoWidth,
+        height: _videoElement!.videoHeight,
+      );
+      final ctx = canvas.context2D;
+      ctx.drawImage(_videoElement!, 0, 0);
 
-img.Image? _convertCameraImage(CameraImage image) {
-  try {
-    final int width = image.width;
-    final int height = image.height;
+      final dataUrl = canvas.toDataUrl('image/jpeg', 0.8);
+      final base64 = dataUrl.split(',').last;
 
-    final yPlane = image.planes[0];
-    final uPlane = image.planes[1];
-    final vPlane = image.planes[2];
+      final res = await http.post(
+        Uri.parse('$_kFlaskBaseUrl/infer'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'image': base64, 'page': 1}),
+      ).timeout(const Duration(seconds: 8));
 
-    final yBytes = yPlane.bytes;
-    final uBytes = uPlane.bytes;
-    final vBytes = vPlane.bytes;
-
-    final imgResult = img.Image(width: width, height: height);
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        final int yIndex = y * yPlane.bytesPerRow + x;
-        final int uvIndex =
-            (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2) * uPlane.bytesPerPixel!;
-
-        final int yVal = yBytes[yIndex];
-        final int uVal = uBytes[uvIndex];
-        final int vVal = vBytes[uvIndex];
-
-        final int r = (yVal + 1.402 * (vVal - 128)).clamp(0, 255).toInt();
-        final int g = (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128))
-            .clamp(0, 255).toInt();
-        final int b = (yVal + 1.772 * (uVal - 128)).clamp(0, 255).toInt();
-
-        imgResult.setPixelRgb(x, y, r, g, b);
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        _applyScore((data['focus_score'] as num).toDouble());
       }
+    } catch (e) {
+      debugPrint('[Inference] 오류: $e');
+    } finally {
+      _isProcessingFrame = false;
     }
-    return imgResult;
-  } catch (e) {
-    debugPrint('[Convert] 오류: $e');
-    return null;
   }
-}
 
   void _applyScore(double score) {
     if (!mounted) return;
@@ -347,43 +200,6 @@ img.Image? _convertCameraImage(CameraImage image) {
         if (!_showAiBubble) _showAiBubble = true;
       }
     });
-    _uploadLog(score);
-  }
-
-  Future<void> _uploadLog(double score) async {
-    if (_sessionId == null) return;
-    try {
-      await FirebaseService.uploadConcentrationLog(
-        studentUid: widget.studentId,
-        sessionId: _sessionId!,
-        state: score >= 0.6 ? 'focused' : 'confused',
-        confidence: score,
-      );
-    } catch (e) {
-      debugPrint('[Firebase] 로그 실패: $e');
-    }
-  }
-
-  // ── PDF ───────────────────────────────────
-  Future<void> _pickPdf() async {
-    setState(() => _pdfLoading = true);
-    try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['pdf'],
-      );
-      if (result != null && result.files.single.path != null && mounted) {
-        setState(() {
-          _pdfPath = result.files.single.path!;
-          _currentPage = 0;
-          _msgs.clear();
-        });
-      }
-    } catch (e) {
-      debugPrint('[PDF] 선택 오류: $e');
-    } finally {
-      if (mounted) setState(() => _pdfLoading = false);
-    }
   }
 
   // ── Gemini ────────────────────────────────
@@ -394,9 +210,9 @@ img.Image? _convertCameraImage(CameraImage image) {
       _geminiLoading = true;
     });
     try {
-      final pdfName = _pdfPath?.split('/').last ?? widget.courseName;
+      final pdfName = _pdfName ?? widget.courseName;
       final res = await _chatSession.sendMessage(
-        Content.text('[현재: $pdfName ${_currentPage + 1}페이지]\n$q'),
+        Content.text('[현재 강의: $pdfName]\n$q'),
       );
       setState(() {
         _msgs.add(_Msg(text: res.text ?? '응답 없음', isUser: false));
@@ -416,8 +232,7 @@ img.Image? _convertCameraImage(CameraImage image) {
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (_) => _GeminiSheet(
-        pdfPath: _pdfPath,
-        currentPage: _currentPage,
+        pdfName: _pdfName,
         msgs: _msgs,
         loading: _geminiLoading,
         onSend: _sendToGemini,
@@ -426,7 +241,8 @@ img.Image? _convertCameraImage(CameraImage image) {
   }
 
   void _endLearning() {
-    _endSession();
+    _inferenceTimer?.cancel();
+    _stopCamera();
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
@@ -458,12 +274,13 @@ img.Image? _convertCameraImage(CameraImage image) {
                     fontSize: 15,
                     fontWeight: FontWeight.bold,
                     color: Color(0xFF172B4D))),
-            if (_pdfPath != null)
-              Text('${_currentPage + 1} / $_totalPages 페이지',
+            if (_pdfName != null)
+              Text(_pdfName!,
                   style: const TextStyle(fontSize: 11, color: Colors.grey)),
           ],
         ),
         actions: [
+          // 카메라 상태
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             margin: const EdgeInsets.only(right: 4),
@@ -486,17 +303,13 @@ img.Image? _convertCameraImage(CameraImage image) {
                 ),
                 const SizedBox(width: 4),
                 Text(
-                  _cameraPermissionDenied
-                      ? '권한 거부'
-                      : (!_cameraReady
-                          ? '준비 중'
-                          : (_useRealInference ? 'AI 추론' : '서버 없음')),
+                  !_cameraReady
+                      ? '준비 중'
+                      : (_useRealInference ? 'AI 추론' : '서버 없음'),
                   style: TextStyle(
-                    color: _cameraPermissionDenied
-                        ? Colors.redAccent
-                        : (_cameraReady
-                            ? (_useRealInference ? Colors.green : Colors.orange)
-                            : Colors.grey),
+                    color: _cameraReady
+                        ? (_useRealInference ? Colors.green : Colors.orange)
+                        : Colors.grey,
                     fontSize: 11,
                     fontWeight: FontWeight.bold,
                   ),
@@ -504,16 +317,7 @@ img.Image? _convertCameraImage(CameraImage image) {
               ],
             ),
           ),
-          TextButton.icon(
-            onPressed: _pdfLoading ? null : _pickPdf,
-            icon: _pdfLoading
-                ? const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.file_open_outlined, size: 16),
-            label: const Text('PDF', style: TextStyle(fontSize: 13)),
-          ),
+          // 종료 버튼
           TextButton(
             onPressed: _endLearning,
             style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
@@ -524,9 +328,10 @@ img.Image? _convertCameraImage(CameraImage image) {
       ),
       body: Stack(
         children: [
-          _pdfPath == null ? _placeholder() : _pdfViewer(),
+          // PDF 뷰어 또는 플레이스홀더
+          _pdfUrl == null ? _placeholder() : _webPdfViewer(),
 
-          // 전문도 링 - 오른쪽 상단 플로팅
+          // 전문도 링
           Positioned(
             top: 16,
             right: 16,
@@ -577,14 +382,7 @@ img.Image? _convertCameraImage(CameraImage image) {
             ),
           ),
 
-          if (_cameraPermissionDenied)
-            Positioned(
-              top: 16,
-              left: 14,
-              right: 80,
-              child: _cameraPermissionBanner(),
-            ),
-
+          // AI 기포
           if (_showAiBubble)
             Positioned(
               top: 100,
@@ -603,138 +401,40 @@ img.Image? _convertCameraImage(CameraImage image) {
     );
   }
 
-  Widget _cameraPermissionBanner() {
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.7),
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                _cameraPermissionPermanentlyDenied
-                    ? '카메라 권한 거부됨. 설정에서 허용하세요.'
-                    : '카메라 권한이 필요합니다.',
-                style: const TextStyle(color: Colors.white, fontSize: 11),
-              ),
-            ),
-            TextButton(
-              onPressed: _cameraPermissionPermanentlyDenied
-                  ? openAppSettings
-                  : _initCamera,
-              child: Text(
-                _cameraPermissionPermanentlyDenied ? '설정' : '허용',
-                style: const TextStyle(color: Colors.white),
-              ),
-            ),
-          ],
-        ),
-      ),
+  // ── Web PDF 뷰어 (iframe) ─────────────────
+  Widget _webPdfViewer() {
+    final viewId = 'pdf-${widget.courseName.hashCode}';
+
+    ui_web.platformViewRegistry.registerViewFactory(
+      viewId,
+      (int id) {
+        final iframe = html.IFrameElement()
+          ..src = _pdfUrl
+          ..style.width = '100%'
+          ..style.height = '100%'
+          ..style.border = 'none';
+        return iframe;
+      },
     );
+
+    return HtmlElementView(viewType: viewId);
   }
 
   Widget _placeholder() {
-    return Center(
+    return const Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.picture_as_pdf_outlined,
+          Icon(Icons.picture_as_pdf_outlined,
               size: 80, color: Colors.black26),
-          const SizedBox(height: 20),
-          const Text('PDF 강의 자료를 불러오세요',
+          SizedBox(height: 20),
+          Text('PDF 강의 자료를 불러오는 중...',
               style: TextStyle(fontSize: 17, color: Colors.black45)),
-          const SizedBox(height: 8),
-          const Text('상단 [PDF] 버튼을 눌러 파일을 선택하세요',
+          SizedBox(height: 8),
+          Text('교사가 PDF를 업로드하면 여기에 표시됩니다',
               style: TextStyle(fontSize: 13, color: Colors.black26)),
-          const SizedBox(height: 28),
-          ElevatedButton.icon(
-            onPressed: _pdfLoading ? null : _pickPdf,
-            icon: const Icon(Icons.upload_file),
-            label: const Text('PDF 파일 선택'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF3B71CA),
-              foregroundColor: Colors.white,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
         ],
       ),
-    );
-  }
-
-  Widget _pdfViewer() {
-    return Stack(
-      children: [
-        PDFView(
-          filePath: _pdfPath!,
-          enableSwipe: true,
-          autoSpacing: true,
-          pageFling: true,
-          fitPolicy: FitPolicy.BOTH,
-          onRender: (p) => setState(() => _totalPages = p ?? 0),
-          onViewCreated: (c) => _pdfController = c,
-          onPageChanged: (p, t) => setState(() {
-            _currentPage = p ?? 0;
-            _totalPages = t ?? 0;
-          }),
-          onError: (e) {
-            if (mounted) {
-              ScaffoldMessenger.of(context)
-                  .showSnackBar(SnackBar(content: Text('PDF 오류: $e')));
-            }
-          },
-        ),
-        Positioned(
-          bottom: 100,
-          left: 0,
-          right: 0,
-          child: Center(
-            child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.chevron_left,
-                        color: Colors.white, size: 22),
-                    onPressed: _currentPage > 0
-                        ? () => _pdfController?.setPage(_currentPage - 1)
-                        : null,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
-                  const SizedBox(width: 16),
-                  Text('${_currentPage + 1} / $_totalPages',
-                      style: const TextStyle(
-                          color: Colors.white, fontSize: 13)),
-                  const SizedBox(width: 16),
-                  IconButton(
-                    icon: const Icon(Icons.chevron_right,
-                        color: Colors.white, size: 22),
-                    onPressed: _currentPage < _totalPages - 1
-                        ? () => _pdfController?.setPage(_currentPage + 1)
-                        : null,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -848,15 +548,13 @@ img.Image? _convertCameraImage(CameraImage image) {
 // Gemini 시트
 // ═══════════════════════════════════════════════
 class _GeminiSheet extends StatefulWidget {
-  final String? pdfPath;
-  final int currentPage;
+  final String? pdfName;
   final List<_Msg> msgs;
   final bool loading;
   final Function(String) onSend;
 
   const _GeminiSheet({
-    required this.pdfPath,
-    required this.currentPage,
+    required this.pdfName,
     required this.msgs,
     required this.loading,
     required this.onSend,
@@ -928,9 +626,9 @@ class _GeminiSheetState extends State<_GeminiSheet> {
                               fontWeight: FontWeight.bold,
                               fontSize: 16)),
                       Text(
-                        widget.pdfPath != null
-                            ? '${widget.currentPage + 1}페이지에 대해 질문하세요'
-                            : 'PDF를 먼저 불러오세요',
+                        widget.pdfName != null
+                            ? '${widget.pdfName}에 대해 질문하세요'
+                            : '강의 내용에 대해 질문하세요',
                         style: const TextStyle(
                             color: Colors.white70, fontSize: 12),
                       ),
@@ -945,28 +643,17 @@ class _GeminiSheetState extends State<_GeminiSheet> {
             ),
           ),
 
-          if (widget.msgs.isEmpty && widget.pdfPath != null)
+          if (widget.msgs.isEmpty)
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
                 children: [
-                  const Text('빠른 질문',
-                      style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey,
-                          fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      _chip('이 페이지 요약해줘'),
-                      _chip('핵심 개념 설명해줘'),
-                      _chip('쉬운 예시로 설명해줘'),
-                      _chip('어려운 용어 알려줘'),
-                    ],
-                  ),
+                  _chip('이 내용 요약해줘'),
+                  _chip('핵심 개념 설명해줘'),
+                  _chip('쉬운 예시로 설명해줘'),
+                  _chip('어려운 용어 알려줘'),
                 ],
               ),
             ),
@@ -974,20 +661,10 @@ class _GeminiSheetState extends State<_GeminiSheet> {
           Expanded(
             child: widget.msgs.isEmpty
                 ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.chat_bubble_outline,
-                            size: 56, color: Colors.grey.shade200),
-                        const SizedBox(height: 12),
-                        Text(
-                          widget.pdfPath == null
-                              ? 'PDF를 먼저 불러오세요'
-                              : '궁금한 내용을 질문하세요!',
-                          style: TextStyle(
-                              fontSize: 14, color: Colors.grey.shade400),
-                        ),
-                      ],
+                    child: Text(
+                      '궁금한 내용을 질문하세요!',
+                      style: TextStyle(
+                          fontSize: 14, color: Colors.grey.shade400),
                     ),
                   )
                 : ListView.builder(
@@ -1018,11 +695,9 @@ class _GeminiSheetState extends State<_GeminiSheet> {
                 Expanded(
                   child: TextField(
                     controller: _ctrl,
-                    enabled: widget.pdfPath != null && !widget.loading,
+                    enabled: !widget.loading,
                     decoration: InputDecoration(
-                      hintText: widget.pdfPath == null
-                          ? 'PDF를 먼저 불러오세요'
-                          : '질문을 입력하세요...',
+                      hintText: '질문을 입력하세요...',
                       hintStyle: TextStyle(
                           fontSize: 14, color: Colors.grey.shade400),
                       border: OutlineInputBorder(
@@ -1055,22 +730,18 @@ class _GeminiSheetState extends State<_GeminiSheet> {
                         height: 44,
                         child: CircularProgressIndicator(strokeWidth: 2))
                     : GestureDetector(
-                        onTap: widget.pdfPath == null
-                            ? null
-                            : () {
-                                if (_ctrl.text.trim().isNotEmpty) {
-                                  widget.onSend(_ctrl.text.trim());
-                                  _ctrl.clear();
-                                  _scrollBottom();
-                                }
-                              },
+                        onTap: () {
+                          if (_ctrl.text.trim().isNotEmpty) {
+                            widget.onSend(_ctrl.text.trim());
+                            _ctrl.clear();
+                            _scrollBottom();
+                          }
+                        },
                         child: Container(
                           width: 44,
                           height: 44,
-                          decoration: BoxDecoration(
-                            color: widget.pdfPath == null
-                                ? Colors.grey.shade300
-                                : const Color(0xFF3B71CA),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFF3B71CA),
                             shape: BoxShape.circle,
                           ),
                           child: const Icon(Icons.send_rounded,

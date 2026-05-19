@@ -1,7 +1,6 @@
 // lib/pages/dashboard_page.dart
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
 import '../app_theme.dart';
 import 'course_list_page.dart';
 import 'login_page.dart';
