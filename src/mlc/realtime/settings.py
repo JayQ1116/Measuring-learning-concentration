@@ -28,6 +28,7 @@ USE_HTTPS = os.environ.get("DAISEE_USE_HTTPS", "1") == "1"
 SSL_CERT_PATH = os.environ.get("DAISEE_SSL_CERT", "")
 SSL_KEY_PATH = os.environ.get("DAISEE_SSL_KEY", "")
 FLASK_DEBUG = os.environ.get("DAISEE_FLASK_DEBUG", "0") == "1"
+DISABLE_CAMERA = os.environ.get("DAISEE_DISABLE_CAMERA", "0") == "1"
 CSV_PATH = os.environ.get("DAISEE_CSV_PATH", "outputs/engagement_metrics.csv")
 CSV_WINDOW_SEC = float(os.environ.get("DAISEE_CSV_WINDOW_SEC", "5"))
 DEFAULT_PDF_PATH = PipelineConfig().pdf_path

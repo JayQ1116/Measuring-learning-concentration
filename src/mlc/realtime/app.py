@@ -5,18 +5,37 @@ import os
 from flask import Flask, Response, render_template, request, send_file
 
 try:
+    from supabase import Client, create_client
+except ImportError:  # pragma: no cover - optional dependency
+    Client = None
+    create_client = None
+
+try:
+    from flask_cors import CORS
+except ImportError:  # pragma: no cover - optional dependency
+    CORS = None
+
+try:
     from mlc.realtime.courseware import render_pdf_page
     from mlc.realtime.input import open_camera
     from mlc.realtime.llm.llm import StudentQuestionHandler
     from mlc.realtime.model import (
+        detect_faces_yolo,
         load_inference_model,
         load_yolo_face_model,
+        predict_emotions,
+        preprocess_face,
         setup_gpu_memory_growth,
     )
     from mlc.realtime.output import iter_frames
     from mlc.realtime.settings import (
         CSV_PATH,
         CSV_WINDOW_SEC,
+        SUPABASE_KEY,
+        SUPABASE_STUDENT_ID,
+        SUPABASE_STUDENT_NAME,
+        SUPABASE_URL,
+        DISABLE_CAMERA,
         FLASK_DEBUG,
         IMG_SIZE,
         LABELS,
@@ -47,14 +66,22 @@ except ImportError:
     from mlc.realtime.input import open_camera
     from mlc.realtime.llm.llm import StudentQuestionHandler
     from mlc.realtime.model import (
+        detect_faces_yolo,
         load_inference_model,
         load_yolo_face_model,
+        predict_emotions,
+        preprocess_face,
         setup_gpu_memory_growth,
     )
     from mlc.realtime.output import iter_frames
     from mlc.realtime.settings import (
         CSV_PATH,
         CSV_WINDOW_SEC,
+        SUPABASE_KEY,
+        SUPABASE_STUDENT_ID,
+        SUPABASE_STUDENT_NAME,
+        SUPABASE_URL,
+        DISABLE_CAMERA,
         FLASK_DEBUG,
         IMG_SIZE,
         LABELS,
@@ -83,9 +110,11 @@ def create_app() -> Flask:
 
     model = load_inference_model(MODEL_PATH, IMG_SIZE)
     yolo_face_model = load_yolo_face_model(YOLO_FACE_MODEL_PATH)
-    cap_holder = {"cap": open_camera(0)}
-    if not cap_holder["cap"].isOpened():
-        raise RuntimeError("Failed to open camera device 0")
+    cap_holder = None
+    if not DISABLE_CAMERA:
+        cap_holder = {"cap": open_camera(0)}
+        if not cap_holder["cap"].isOpened():
+            raise RuntimeError("Failed to open camera device 0")
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     pdf_path = PDF_PATH
@@ -99,6 +128,20 @@ def create_app() -> Flask:
         __name__,
         template_folder=os.path.join(base_dir, "templates"),
     )
+    if CORS is not None:
+        CORS(app)
+
+    supabase_client: Client | None = None
+    if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
+        try:
+            supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            if SUPABASE_STUDENT_ID:
+                supabase_client.table("students").upsert({
+                    "id": SUPABASE_STUDENT_ID,
+                    "name": SUPABASE_STUDENT_NAME,
+                }).execute()
+        except Exception:
+            supabase_client = None
 
     @app.route("/")
     def index():
@@ -171,6 +214,7 @@ def create_app() -> Flask:
         import numpy as np
         import cv2
         from flask import jsonify
+        from datetime import datetime, timezone
 
         data = request.get_json()
         if not data or "image" not in data:
@@ -179,21 +223,85 @@ def create_app() -> Flask:
             image_bytes = base64.b64decode(data["image"])
             nparr = np.frombuffer(image_bytes, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if os.environ.get("DAISEE_DEBUG_FRAME", "0") == "1":
+                # Save the received frame for debugging.
+                debug_dir = os.path.join(os.getcwd(), "outputs", "debug_frames")
+                os.makedirs(debug_dir, exist_ok=True)
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+                debug_path = os.path.join(debug_dir, f"frame_{ts}.jpg")
+                if frame is not None:
+                    cv2.imwrite(debug_path, frame)
+                else:
+                    with open(debug_path + ".txt", "w", encoding="utf-8") as f:
+                        f.write("frame decode failed")
             if frame is None:
-                return jsonify({"focus_score": 0.5, "state": "unknown"})
+                # No frame available: return None values and skip DB writes.
+                return jsonify({
+                    "focus_score": None,
+                    "state": "unknown",
+                    "engagement": None,
+                    "boredom": None,
+                    "confusion": None,
+                    "frustration": None,
+                    "samples": None,
+                    "pdf_page": int(data.get("page", 1) or 1),
+                    "pdf_name": PDF_NAME,
+                })
             faces = detect_faces_yolo(yolo_face_model, frame, YOLO_CONFIDENCE, YOLO_IOU)
             if not faces:
-                return jsonify({"focus_score": 0.3, "state": "absent"})
+                # No face detected: return None values and skip DB writes.
+                return jsonify({
+                    "focus_score": None,
+                    "state": "absent",
+                    "engagement": None,
+                    "boredom": None,
+                    "confusion": None,
+                    "frustration": None,
+                    "samples": None,
+                    "pdf_page": int(data.get("page", 1) or 1),
+                    "pdf_name": PDF_NAME,
+                })
             face_tensor = preprocess_face(frame, faces[0], IMG_SIZE)
             emotions = predict_emotions(model, face_tensor)
             focus_score = float(emotions.flatten()[0])
             state = "focused" if focus_score >= 0.6 else "confused"
-            return jsonify({"focus_score": round(focus_score, 3), "state": state})
+            engagement = float(focus_score)
+            boredom = float(emotions.flatten()[1]) if emotions.size > 1 else 0.0
+            confusion = float(emotions.flatten()[2]) if emotions.size > 2 else 0.0
+            frustration = float(emotions.flatten()[3]) if emotions.size > 3 else 0.0
+            samples = 1
+            pdf_page = int(data.get("page", 1) or 1)
+
+            if supabase_client is not None and SUPABASE_STUDENT_ID and not data.get("client_write"):
+                supabase_client.table("engagement_metrics").insert({
+                    "student_id": SUPABASE_STUDENT_ID,
+                    "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    "engagement": engagement,
+                    "boredom": boredom,
+                    "confusion": confusion,
+                    "frustration": frustration,
+                    "samples": samples,
+                    "pdf_page": pdf_page,
+                    "pdf_name": PDF_NAME,
+                }).execute()
+            return jsonify({
+                "focus_score": round(focus_score, 3),
+                "state": state,
+                "engagement": engagement,
+                "boredom": boredom,
+                "confusion": confusion,
+                "frustration": frustration,
+                "samples": samples,
+                "pdf_page": pdf_page,
+                "pdf_name": PDF_NAME,
+            })
         except Exception as e:
             return jsonify({"error": str(e), "focus_score": 0.5, "state": "unknown"}), 500
 
     @app.route("/video_feed")
     def video_feed():
+        if DISABLE_CAMERA or cap_holder is None:
+            return Response("Camera disabled", status=404)
         return Response(
             iter_frames(
                 model,
@@ -215,6 +323,46 @@ def create_app() -> Flask:
             ),
             mimetype="multipart/x-mixed-replace; boundary=frame",
         )
+
+    @app.route("/infer_debug", methods=["POST"])
+    def infer_debug():
+        """Debug endpoint: create a fresh Supabase client and attempt to insert the
+        same payload that /infer would insert, returning the PostgREST response.
+        This helps check whether the server key in environment is accepted.
+        """
+        from datetime import datetime, timezone
+
+        data = request.get_json() or {}
+        page = int(data.get("page", 1) or 1)
+
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            return jsonify({"error": "SUPABASE_URL/SUPABASE_KEY not set"}), 400
+
+        try:
+            client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as exc:
+            return jsonify({"error": f"create_client failed: {exc}"}), 500
+
+        try:
+            res = client.table("engagement_metrics").insert({
+                "student_id": SUPABASE_STUDENT_ID,
+                "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                "engagement": None,
+                "boredom": None,
+                "confusion": None,
+                "frustration": None,
+                "samples": None,
+                "pdf_page": page,
+                "pdf_name": PDF_NAME,
+            }).execute()
+            # Attempt to return a compact summary of the response
+            return jsonify({
+                "status": getattr(res, "status_code", None) or getattr(res, "status", None),
+                "data": getattr(res, "data", None),
+                "error": getattr(res, "error", None),
+            })
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     return app
 

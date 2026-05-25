@@ -2,6 +2,7 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 import 'teacher_monitoring_page.dart';
 import 'login_page.dart';
 
@@ -17,6 +18,7 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
   List<Map<String, dynamic>> _courses = [];
   bool _loading = true;
   String _teacherName = '선생님';
+  String? _teacherEmail;
   bool _uploading = false;
 
   @override
@@ -33,16 +35,19 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
 
       final teacher = await _supabase
           .from('teachers')
-          .select('name')
+          .select('name, email')
           .eq('id', user.id)
           .maybeSingle();
       if (teacher != null) {
-        setState(() => _teacherName = teacher['name'] ?? '선생님');
+        setState(() {
+          _teacherName = teacher['name'] ?? '선생님';
+          _teacherEmail = teacher['email'] as String?;
+        });
       }
 
       final courses = await _supabase
           .from('courses')
-          .select('id, name, pdf_url, created_at')
+          .select('id, name, pdf_url, pdf_id, created_at')
           .order('created_at', ascending: false);
 
       setState(() => _courses = List<Map<String, dynamic>>.from(courses));
@@ -65,10 +70,12 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
       setState(() => _uploading = true);
 
       final bytes = result.files.single.bytes!;
-      final fileName = '${courseId}_${DateTime.now().millisecondsSinceEpoch}.pdf';
+      final pdfId = const Uuid().v4();
+      final fileName = '$pdfId.pdf';
+      final storagePath = 'courses/$courseId/$fileName';
 
-      await _supabase.storage.from('pdfs').uploadBinary(
-        fileName,
+      await _supabase.storage.from('pdf').uploadBinary(
+        storagePath,
         bytes,
         fileOptions: const FileOptions(
           contentType: 'application/pdf',
@@ -76,11 +83,15 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
         ),
       );
 
-      final url = _supabase.storage.from('pdfs').getPublicUrl(fileName);
+        final url = _supabase.storage.from('pdf').getPublicUrl(storagePath);
 
-      await _supabase
+        await _supabase
           .from('courses')
-          .update({'pdf_url': url})
+          .update({
+            'pdf_url': url,
+            'pdf_id': pdfId,
+            'teacher_email': _teacherEmail ?? _supabase.auth.currentUser?.email,
+          })
           .eq('id', courseId);
 
       if (mounted) {
@@ -212,6 +223,62 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
       _loadData();
     } catch (e) {
       debugPrint('[Course] 추가 실패: $e');
+    }
+  }
+
+  Future<void> _deleteCourse(String courseId, String courseName,
+      {String? pdfId}) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('강의 삭제'),
+        content: Text('"$courseName" 강의를 삭제할까요?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('취소'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('삭제'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      if (pdfId != null && pdfId.isNotEmpty) {
+        final storagePath = 'courses/$courseId/$pdfId.pdf';
+        await _supabase.storage.from('pdf').remove([storagePath]);
+      }
+      await _supabase.from('courses').delete().eq('id', courseId);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('"$courseName" 강의가 삭제되었습니다.'),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      _loadData();
+    } catch (e) {
+      debugPrint('[Course] 삭제 실패: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('강의 삭제 실패: $e'),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
     }
   }
 
@@ -438,6 +505,7 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
     final courseId = course['id'] as String;
     final courseName = course['name'] as String;
     final pdfUrl = course['pdf_url'] as String?;
+    final pdfId = course['pdf_id'] as String?;
     final hasPdf = pdfUrl != null && pdfUrl.isNotEmpty;
 
     return Container(
@@ -515,6 +583,13 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
                     ],
                   ),
                 ),
+                IconButton(
+                  onPressed: () =>
+                      _deleteCourse(courseId, courseName, pdfId: pdfId),
+                  icon: const Icon(Icons.delete_outline),
+                  color: Colors.redAccent,
+                  tooltip: '강의 삭제',
+                ),
               ],
             ),
           ),
@@ -551,7 +626,10 @@ class _TeacherDashboardPageState extends State<TeacherDashboardPage> {
                       context,
                       MaterialPageRoute(
                         builder: (_) =>
-                            TeacherMonitoringPage(courseName: courseName),
+                            TeacherMonitoringPage(
+                              courseName: courseName,
+                              pdfId: pdfId,
+                            ),
                       ),
                     ),
                     icon: const Icon(Icons.bar_chart_rounded, size: 16),

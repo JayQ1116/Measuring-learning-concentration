@@ -1,31 +1,39 @@
 import 'dart:async';
-import 'dart:math';
-import 'package:flutter/material.dart';
+
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class TeacherMonitoringPage extends StatefulWidget {
   final String courseName;
-  const TeacherMonitoringPage({super.key, required this.courseName});
+  final String? pdfId;
+
+  const TeacherMonitoringPage({
+    super.key,
+    required this.courseName,
+    this.pdfId,
+  });
 
   @override
   State<TeacherMonitoringPage> createState() => _TeacherMonitoringPageState();
 }
 
 class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
-  final Random _rng = Random();
+  final _supabase = Supabase.instance.client;
+
   Timer? _timer;
-  late DateTime _startTime;
-  late List<int> _focusScores;
-  final List<Map<String, dynamic>> _heatmapMarks = [];
   String _timeStr = '';
+  bool _loading = true;
+  List<_StudentFocus> _students = [];
+  List<_PageFocus> _pageFocus = [];
+  Map<int, List<_PageStudentScore>> _pageStudentScores = {};
+  int _totalPages = 0;
 
   @override
   void initState() {
     super.initState();
-    _startTime = DateTime.now();
-    _focusScores = List.generate(32, (i) => 50 + _rng.nextInt(50));
-    _updateTime();
-    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _simulateFocusChange());
+    _tick();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _tick());
   }
 
   @override
@@ -34,32 +42,203 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
     super.dispose();
   }
 
-  void _updateTime() {
+  Future<void> _tick() async {
     final now = DateTime.now();
-    setState(() => _timeStr =
-        "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}");
-  }
+    final timeStr =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
 
-  void _simulateFocusChange() {
-    setState(() {
-      for (int i = 0; i < 32; i++) {
-        final delta = _rng.nextInt(11) - 5;
-        _focusScores[i] = (_focusScores[i] + delta).clamp(10, 100);
+    try {
+      final user = _supabase.auth.currentUser;
+      if (user == null) {
+        if (!mounted) return;
+        setState(() {
+          _timeStr = timeStr;
+          _students = [];
+          _loading = false;
+        });
+        return;
       }
-      final lowCount = _focusScores.where((s) => s < 40).length;
-      if (lowCount >= 3 && _heatmapMarks.length < 5) {
-        final elapsed = DateTime.now().difference(_startTime).inMinutes;
-        final topics = ["역전파(Backpropagation)", "경사하강법(Gradient Descent)", "활성화 함수(Activation)", "손실 함수(Loss Function)", "배치 정규화(Batch Norm)"];
-        final alreadyMarked = _heatmapMarks.map((m) => m['topic']).toSet();
-        for (final topic in topics) {
-          if (!alreadyMarked.contains(topic)) {
-            _heatmapMarks.add({'topic': topic, 'minute': elapsed, 'count': lowCount});
-            break;
+
+      final rosterRows = await _supabase
+          .from('teacher_students')
+          .select('student_id, students(name)')
+          .eq('teacher_id', user.id);
+
+      final studentIds = <String>[];
+      final nameById = <String, String>{};
+      for (final row in rosterRows) {
+        final id = row['student_id'] as String?;
+        if (id == null || id.isEmpty) continue;
+        studentIds.add(id);
+        String? joinedName;
+        final joined = row['students'];
+        if (joined is Map<String, dynamic>) {
+          joinedName = joined['name'] as String?;
+        } else if (joined is List && joined.isNotEmpty) {
+          final first = joined.first;
+          if (first is Map<String, dynamic>) {
+            joinedName = first['name'] as String?;
+          }
+        }
+        if (joinedName != null && joinedName.trim().isNotEmpty) {
+          nameById[id] = joinedName.trim();
+        }
+      }
+
+      if (studentIds.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _timeStr = timeStr;
+          _students = [];
+          _loading = false;
+        });
+        return;
+      }
+
+      final unresolved = studentIds.where((id) => !nameById.containsKey(id)).toList();
+      if (unresolved.isNotEmpty) {
+        await _fillNamesFromStudents(
+          unresolvedIds: unresolved,
+          nameById: nameById,
+        );
+      }
+
+      var query = _supabase
+          .from('engagement_metrics')
+          .select('student_id, engagement, timestamp, pdf_id, pdf_name, pdf_page, pdf_total_pages')
+          .inFilter('student_id', studentIds);
+
+      if (widget.pdfId != null && widget.pdfId!.isNotEmpty) {
+        query = query.eq('pdf_id', widget.pdfId!);
+      } else {
+        query = query.eq('pdf_name', widget.courseName);
+      }
+
+      final metricRows = await query.order('timestamp', ascending: false).limit(3000);
+
+      final latestByStudent = <String, Map<String, dynamic>>{};
+      for (final row in metricRows) {
+        final id = row['student_id'] as String?;
+        if (id == null || id.isEmpty || latestByStudent.containsKey(id)) continue;
+        latestByStudent[id] = row;
+      }
+
+      final students = <_StudentFocus>[];
+      for (final id in studentIds) {
+        final latest = latestByStudent[id];
+        final engagement = (latest?['engagement'] as num?)?.toDouble() ?? 0.0;
+        final score = (engagement * 100).round().clamp(0, 100);
+        students.add(_StudentFocus(
+          studentId: id,
+          studentName: (nameById[id]?.isNotEmpty == true) ? nameById[id]! : id,
+          score: score,
+          timestamp: latest?['timestamp'] as String?,
+          isOffline: _isOffline(latest?['timestamp'] as String?),
+        ));
+      }
+
+      students.sort((a, b) => a.studentName.compareTo(b.studentName));
+
+      final byPage = <int, _PageBucket>{};
+      final byPageStudent = <int, Map<String, _StudentAggregate>>{};
+      var totalPages = 0;
+      for (final row in metricRows) {
+        final page = (row['pdf_page'] as num?)?.toInt();
+        final total = (row['pdf_total_pages'] as num?)?.toInt();
+        final engagement = (row['engagement'] as num?)?.toDouble();
+        final studentId = row['student_id'] as String?;
+        final timestamp = row['timestamp'] as String?;
+        if (total != null && total > totalPages) totalPages = total;
+        if (page == null || page <= 0 || engagement == null) continue;
+        byPage.putIfAbsent(page, () => _PageBucket()).add(engagement.clamp(0.0, 1.0));
+        if (studentId != null && studentId.isNotEmpty) {
+          byPageStudent.putIfAbsent(page, () => <String, _StudentAggregate>{});
+          final map = byPageStudent[page]!;
+          final agg = map.putIfAbsent(studentId, () => _StudentAggregate());
+          agg.sum += engagement.clamp(0.0, 1.0);
+          agg.count += 1;
+          if (timestamp != null && (agg.latestTimestamp == null || timestamp.compareTo(agg.latestTimestamp!) > 0)) {
+            agg.latestTimestamp = timestamp;
           }
         }
       }
-      _updateTime();
-    });
+      final pageFocus = byPage.entries.map((e) {
+        final avg = e.value.count == 0 ? 0.0 : e.value.sum / e.value.count;
+        return _PageFocus(page: e.key, score: (avg * 100).round().clamp(0, 100));
+      }).toList()
+        ..sort((a, b) => a.page.compareTo(b.page));
+      final pageStudentScores = <int, List<_PageStudentScore>>{};
+      for (final entry in byPageStudent.entries) {
+        final list = entry.value.entries.map((e) {
+          final studentId = e.key;
+          final agg = e.value;
+          final avgScore = agg.count == 0 ? 0 : ((agg.sum / agg.count) * 100).round().clamp(0, 100);
+          final latest = agg.latestTimestamp;
+          return _PageStudentScore(
+            studentId: studentId,
+            studentName: (nameById[studentId]?.isNotEmpty == true) ? nameById[studentId]! : studentId,
+            score: avgScore,
+            timestamp: latest,
+            isOffline: _isOffline(latest),
+          );
+        }).toList()
+          ..sort((a, b) => b.score.compareTo(a.score));
+        pageStudentScores[entry.key] = list;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _timeStr = timeStr;
+        _students = students;
+        _pageFocus = pageFocus;
+        _pageStudentScores = pageStudentScores;
+        _totalPages = totalPages;
+        _loading = false;
+      });
+    } catch (e) {
+      debugPrint('[TeacherMonitoringPage] load failed: $e');
+      if (!mounted) return;
+      setState(() {
+        _timeStr = timeStr;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _fillNamesFromStudents({
+    required List<String> unresolvedIds,
+    required Map<String, String> nameById,
+  }) async {
+    Future<void> tryKey(String key) async {
+      try {
+        final rows = await _supabase
+            .from('students')
+            .select('id, name, $key')
+            .inFilter(key, unresolvedIds);
+        for (final row in rows) {
+          final rawName = row['name'] as String?;
+          if (rawName == null || rawName.trim().isEmpty) continue;
+          final mapped = row[key] as String?;
+          if (mapped != null && mapped.isNotEmpty) {
+            nameById[mapped] = rawName.trim();
+          }
+          final id = row['id'] as String?;
+          if (id != null && id.isNotEmpty) {
+            nameById[id] = rawName.trim();
+          }
+        }
+      } catch (_) {
+        // ignore missing-column and RLS-path failures for fallback keys
+      }
+    }
+
+    await tryKey('id');
+    final still = unresolvedIds.where((id) => !nameById.containsKey(id)).toList();
+    if (still.isEmpty) return;
+    await tryKey('student_id');
+    await tryKey('user_id');
+    await tryKey('auth_user_id');
+    await tryKey('email');
   }
 
   Color _focusColor(int score) {
@@ -68,11 +247,21 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
     return const Color(0xFFE74C3C);
   }
 
+  bool _isOffline(String? timestamp) {
+    if (timestamp == null || timestamp.isEmpty) return true;
+    final ts = DateTime.tryParse(timestamp);
+    if (ts == null) return true;
+    final diff = DateTime.now().toUtc().difference(ts.toUtc()).inSeconds.abs();
+    return diff > 5;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final focused = _focusScores.where((s) => s >= 70).length;
-    final normal = _focusScores.where((s) => s >= 50 && s < 70).length;
-    final attention = _focusScores.where((s) => s < 50).length;
+    final focused = _students.where((s) => !s.isOffline && s.score >= 70).length;
+    final normal = _students.where((s) => !s.isOffline && s.score >= 50 && s.score < 70).length;
+    final attention = _students.where((s) => !s.isOffline && s.score < 50).length;
+    final offline = _students.where((s) => s.isOffline).length;
+    final total = _students.length;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0F1B35),
@@ -86,7 +275,10 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("교사 대시보드", style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+            const Text(
+              'Class Monitoring',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+            ),
             Text(widget.courseName, style: const TextStyle(fontSize: 11, color: Colors.white60)),
           ],
         ),
@@ -100,155 +292,186 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
           const SizedBox(width: 4),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                _buildStatCard("전체 학생", "32명", Icons.people_outline, const Color(0xFF1E2D4F), Colors.white70),
-                const SizedBox(width: 12),
-                _buildStatCard("집중 중", "${focused}명", Icons.trending_up, const Color(0xFF1A3A2A), const Color(0xFF2ECC71)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                _buildStatCard("보통", "${normal}명", Icons.access_time_outlined, const Color(0xFF3A2A10), const Color(0xFFF39C12)),
-                const SizedBox(width: 12),
-                _buildStatCard("주의 필요", "${attention}명", Icons.warning_amber_outlined, const Color(0xFF3A1020), const Color(0xFFE74C3C)),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Container(
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text("실시간 학급 현황", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                  const SizedBox(height: 16),
-                  GridView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 8, crossAxisSpacing: 6, mainAxisSpacing: 6, childAspectRatio: 1,
-                    ),
-                    itemCount: 32,
-                    itemBuilder: (context, i) {
-                      final score = _focusScores[i];
-                      final color = _focusColor(score);
-                      return GestureDetector(
-                        onTap: () => _showStudentDetail(context, i, score),
-                        child: Container(
-                          decoration: BoxDecoration(color: color.withValues(alpha: 0.85), borderRadius: BorderRadius.circular(6)),
-                          child: Center(
-                            child: Text("${(i + 1).toString().padLeft(2, '0')}",
-                              style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold)),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  Wrap(spacing: 16, children: [
-                    _buildLegendDot(const Color(0xFF2ECC71), "집중"),
-                    _buildLegendDot(const Color(0xFFF39C12), "보통"),
-                    _buildLegendDot(const Color(0xFFE74C3C), "주의"),
-                  ]),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text("집중도 분포", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                  const SizedBox(height: 16),
                   Row(
                     children: [
-                      SizedBox(
-                        height: 150, width: 150,
-                        child: PieChart(PieChartData(
-                          sections: [
-                            PieChartSectionData(value: focused.toDouble(), color: const Color(0xFF2ECC71),
-                              title: focused > 0 ? "${(focused / 32 * 100).round()}%" : "", radius: 60,
-                              titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
-                            PieChartSectionData(value: normal.toDouble(), color: const Color(0xFFF39C12),
-                              title: normal > 0 ? "${(normal / 32 * 100).round()}%" : "", radius: 60,
-                              titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
-                            PieChartSectionData(value: attention.toDouble(), color: const Color(0xFFE74C3C),
-                              title: attention > 0 ? "${(attention / 32 * 100).round()}%" : "", radius: 60,
-                              titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
-                          ],
-                          sectionsSpace: 3, centerSpaceRadius: 25,
-                        )),
-                      ),
-                      const SizedBox(width: 20),
-                      Expanded(child: Column(children: [
-                        _buildLegendRow(const Color(0xFF2ECC71), "집중 (70+)", focused),
-                        const SizedBox(height: 12),
-                        _buildLegendRow(const Color(0xFFF39C12), "보통 (50~69)", normal),
-                        const SizedBox(height: 12),
-                        _buildLegendRow(const Color(0xFFE74C3C), "분산/피로", attention),
-                      ])),
+                      _buildStatCard('Students', '$total', Icons.people_outline, const Color(0xFF1E2D4F), Colors.white70),
+                      const SizedBox(width: 12),
+                      _buildStatCard('Focused', '$focused', Icons.trending_up, const Color(0xFF1A3A2A), const Color(0xFF2ECC71)),
                     ],
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(children: [
-                    const Icon(Icons.warning_amber_rounded, color: Color(0xFFE74C3C), size: 18),
-                    const SizedBox(width: 8),
-                    const Text("주의가 필요한 학생", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                  ]),
                   const SizedBox(height: 12),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(children: [
-                      for (int i = 0; i < 32; i++)
-                        if (_focusScores[i] < 50) _buildAttentionStudentCard(i, _focusScores[i]),
-                    ]),
+                  Row(
+                    children: [
+                      _buildStatCard('Normal', '$normal', Icons.access_time_outlined, const Color(0xFF3A2A10), const Color(0xFFF39C12)),
+                      const SizedBox(width: 12),
+                      _buildStatCard('Need Help', '$attention', Icons.warning_amber_outlined, const Color(0xFF3A1020), const Color(0xFFE74C3C)),
+                    ],
                   ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      _buildStatCard('Offline', '$offline', Icons.cloud_off_outlined, const Color(0xFF2A2F3A), Colors.white70),
+                      const SizedBox(width: 12),
+                      const Expanded(child: SizedBox.shrink()),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Live Focus Grid',
+                          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                        const SizedBox(height: 16),
+                        if (_students.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 12),
+                            child: Text('No student metrics yet for this course.', style: TextStyle(color: Colors.white60)),
+                          )
+                        else
+                          GridView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 8,
+                              crossAxisSpacing: 6,
+                              mainAxisSpacing: 6,
+                              childAspectRatio: 1,
+                            ),
+                            itemCount: _students.length,
+                            itemBuilder: (context, i) {
+                              final student = _students[i];
+                              final color = student.isOffline ? Colors.grey : _focusColor(student.score);
+                              return GestureDetector(
+                                onTap: () => _showStudentDetail(context, student),
+                                child: Container(
+                                  decoration: BoxDecoration(color: color.withValues(alpha: 0.85), borderRadius: BorderRadius.circular(6)),
+                                  child: Center(
+                                    child: Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Text(
+                                          '${i + 1}'.padLeft(2, '0'),
+                                          style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+                                        ),
+                                        if (student.isOffline)
+                                          const Text(
+                                            'OFF',
+                                            style: TextStyle(color: Colors.white70, fontSize: 7, fontWeight: FontWeight.bold),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Focus Distribution', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            SizedBox(
+                              height: 150,
+                              width: 150,
+                              child: PieChart(
+                                PieChartData(
+                                  sections: [
+                                    PieChartSectionData(
+                                      value: focused.toDouble(),
+                                      color: const Color(0xFF2ECC71),
+                                      title: total > 0 && focused > 0 ? '${(focused / total * 100).round()}%' : '',
+                                      radius: 60,
+                                      titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                                    ),
+                                    PieChartSectionData(
+                                      value: normal.toDouble(),
+                                      color: const Color(0xFFF39C12),
+                                      title: total > 0 && normal > 0 ? '${(normal / total * 100).round()}%' : '',
+                                      radius: 60,
+                                      titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                                    ),
+                                    PieChartSectionData(
+                                      value: attention.toDouble(),
+                                      color: const Color(0xFFE74C3C),
+                                      title: total > 0 && attention > 0 ? '${(attention / total * 100).round()}%' : '',
+                                      radius: 60,
+                                      titleStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                                    ),
+                                  ],
+                                  sectionsSpace: 3,
+                                  centerSpaceRadius: 25,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 20),
+                            Expanded(
+                              child: Column(
+                                children: [
+                                  _buildLegendRow(const Color(0xFF2ECC71), 'Focused (70+)', focused),
+                                  const SizedBox(height: 12),
+                                  _buildLegendRow(const Color(0xFFF39C12), 'Normal (50-69)', normal),
+                                  const SizedBox(height: 12),
+                                  _buildLegendRow(const Color(0xFFE74C3C), 'Need Help (<50)', attention),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(Icons.warning_amber_rounded, color: Color(0xFFE74C3C), size: 18),
+                            SizedBox(width: 8),
+                            Text('Students Need Help', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              for (final student in _students.where((s) => !s.isOffline && s.score < 50))
+                                _buildAttentionStudentCard(student),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
                 ],
               ),
             ),
-            if (_heatmapMarks.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(color: const Color(0xFF162040), borderRadius: BorderRadius.circular(20)),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(children: [
-                      const Icon(Icons.bar_chart, color: Color(0xFFF39C12), size: 18),
-                      const SizedBox(width: 8),
-                      const Expanded(child: Text("집중도 저하 구간", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white))),
-                      TextButton(onPressed: () => _showHeatmapDialog(context),
-                        child: const Text("전체 보기 →", style: TextStyle(color: Color(0xFFF39C12), fontSize: 12))),
-                    ]),
-                    const SizedBox(height: 12),
-                    for (final mark in _heatmapMarks) _buildHeatmapItem(mark),
-                  ],
-                ),
-              ),
-            ],
-            const SizedBox(height: 20),
-          ],
-        ),
-      ),
     );
   }
 
@@ -257,147 +480,351 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
       child: Container(
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(color: bgColor, borderRadius: BorderRadius.circular(14)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-            Flexible(child: Text(title, style: const TextStyle(fontSize: 11, color: Colors.white60), overflow: TextOverflow.ellipsis)),
-            Icon(icon, color: Colors.white30, size: 16),
-          ]),
-          const SizedBox(height: 8),
-          Text(value, style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: valueColor)),
-        ]),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Flexible(
+                  child: Text(title, style: const TextStyle(fontSize: 11, color: Colors.white60), overflow: TextOverflow.ellipsis),
+                ),
+                Icon(icon, color: Colors.white30, size: 16),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(value, style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: valueColor)),
+          ],
+        ),
       ),
     );
-  }
-
-  Widget _buildLegendDot(Color color, String label) {
-    return Row(mainAxisSize: MainAxisSize.min, children: [
-      Container(width: 8, height: 8, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-      const SizedBox(width: 4),
-      Text(label, style: const TextStyle(fontSize: 11, color: Colors.white60)),
-    ]);
   }
 
   Widget _buildLegendRow(Color color, String label, int count) {
-    return Row(children: [
-      Container(width: 10, height: 10, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-      const SizedBox(width: 8),
-      Expanded(child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white60))),
-      Text("$count명", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: color)),
-    ]);
-  }
-
-  Widget _buildAttentionStudentCard(int index, int score) {
-    final names = ["학생 A","학생 B","학생 C","학생 D","학생 E","학생 F","학생 G","학생 H","학생 I","학생 J","학생 K","학생 L","학생 M","학생 N","학생 O","학생 P","학생 Q","학생 R","학생 S","학생 T","학생 U","학생 V","학생 W","학생 X","학생 Y","학생 Z","학생 AA","학생 BB","학생 CC","학생 DD","학생 EE","학생 FF"];
-    return Container(
-      width: 120, margin: const EdgeInsets.only(right: 10), padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1E2D4F), borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFE74C3C).withValues(alpha: 0.3)),
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(names[index], style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-        const SizedBox(height: 6),
-        Text("$score점", style: const TextStyle(color: Color(0xFFE74C3C), fontSize: 20, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 4),
-        ClipRRect(borderRadius: BorderRadius.circular(4),
-          child: LinearProgressIndicator(value: score / 100, minHeight: 4,
-            backgroundColor: Colors.white12, valueColor: const AlwaysStoppedAnimation(Color(0xFFE74C3C)))),
-      ]),
-    );
-  }
-
-  Widget _buildHeatmapItem(Map<String, dynamic> mark) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFFE74C3C).withValues(alpha: 0.1), borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFFE74C3C).withValues(alpha: 0.3)),
-      ),
-      child: Row(children: [
-        const Icon(Icons.flag_outlined, color: Color(0xFFE74C3C), size: 16),
-        const SizedBox(width: 10),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(mark['topic'], style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-          Text("${mark['minute']}분 경 • ${mark['count']}명 영향", style: const TextStyle(color: Colors.white60, fontSize: 11)),
-        ])),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-          decoration: BoxDecoration(color: const Color(0xFFE74C3C).withValues(alpha: 0.2), borderRadius: BorderRadius.circular(6)),
-          child: const Text("난이도 높음", style: TextStyle(color: Color(0xFFE74C3C), fontSize: 10, fontWeight: FontWeight.bold)),
-        ),
-      ]),
-    );
-  }
-
-  void _showStudentDetail(BuildContext context, int index, int score) {
-    showDialog(context: context, builder: (ctx) => AlertDialog(
-      backgroundColor: const Color(0xFF162040),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      title: Text("학생 ${(index + 1).toString().padLeft(3, '0')} 상세",
-        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-      content: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text("$score점", style: TextStyle(color: _focusColor(score), fontSize: 36, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
-        Text(score >= 70 ? "✅ 정상적으로 학습 중입니다" : score >= 50 ? "⚠️ 집중도가 다소 낮습니다" : "🚨 주의가 필요합니다",
-          style: const TextStyle(color: Colors.white70, fontSize: 14)),
-      ]),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("닫기", style: TextStyle(color: Colors.white60))),
-        if (score < 50) ElevatedButton(
-          onPressed: () => Navigator.pop(ctx),
-          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE74C3C)),
-          child: const Text("AI 도움 전송")),
+    return Row(
+      children: [
+        Container(width: 10, height: 10, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 8),
+        Expanded(child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white60))),
+        Text('$count', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: color)),
       ],
-    ));
+    );
+  }
+
+  Widget _buildAttentionStudentCard(_StudentFocus student) {
+    return Container(
+      width: 150,
+      margin: const EdgeInsets.only(right: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E2D4F),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE74C3C).withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(student.studentName, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+          const SizedBox(height: 6),
+          Text(
+            student.isOffline ? 'Offline' : '${student.score}',
+            style: TextStyle(
+              color: student.isOffline ? Colors.white60 : const Color(0xFFE74C3C),
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 4),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: student.isOffline ? 0 : (student.score / 100),
+              minHeight: 4,
+              backgroundColor: Colors.white12,
+              valueColor: AlwaysStoppedAnimation(student.isOffline ? Colors.grey : const Color(0xFFE74C3C)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showStudentDetail(BuildContext context, _StudentFocus student) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF162040),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(student.studentName, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              student.isOffline ? 'Offline' : '${student.score}',
+              style: TextStyle(
+                color: student.isOffline ? Colors.grey : _focusColor(student.score),
+                fontSize: 36,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              student.timestamp ?? 'No timestamp',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close', style: TextStyle(color: Colors.white60)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color _pageHeatColor(int score) {
+    if (score >= 70) return const Color(0xFF2ECC71);
+    if (score >= 50) return const Color(0xFFF39C12);
+    return const Color(0xFFE74C3C);
+  }
+
+  Widget _buildHeatCell(int page, int score) {
+    final color = _pageHeatColor(score);
+    return GestureDetector(
+      onTap: () => _showPageStudentScoresDialog(page),
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.85),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text('$page', style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+            Text('$score', style: const TextStyle(color: Colors.white, fontSize: 9)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyHeatCell(int page) {
+    return GestureDetector(
+      onTap: () => _showPageStudentScoresDialog(page),
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          color: Colors.white12,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Center(
+          child: Text('$page', style: const TextStyle(color: Colors.white60, fontSize: 10, fontWeight: FontWeight.bold)),
+        ),
+      ),
+    );
+  }
+
+  void _showPageStudentScoresDialog(int page) {
+    final scores = _pageStudentScores[page] ?? const <_PageStudentScore>[];
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: const Color(0xFF162040),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Page $page Student Scores', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              if (scores.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 20),
+                  child: Text('No student data on this page yet.', style: TextStyle(color: Colors.white60)),
+                )
+              else
+                SizedBox(
+                  width: 420,
+                  height: 320,
+                  child: ListView.separated(
+                    itemCount: scores.length,
+                    separatorBuilder: (_, __) => const Divider(color: Colors.white12, height: 1),
+                    itemBuilder: (_, i) {
+                      final s = scores[i];
+                      return ListTile(
+                        dense: true,
+                        title: Text(s.studentName, style: const TextStyle(color: Colors.white, fontSize: 13)),
+                        subtitle: Text(s.timestamp ?? '-', style: const TextStyle(color: Colors.white60, fontSize: 11)),
+                        trailing: Text(
+                          s.isOffline ? 'Offline · Avg ${s.score}' : '${s.score}',
+                          style: TextStyle(
+                            color: s.isOffline ? Colors.grey : _focusColor(s.score),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Close', style: TextStyle(color: Colors.white70)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _showHeatmapDialog(BuildContext context) {
-    showDialog(context: context, builder: (ctx) => Dialog(
-      backgroundColor: const Color(0xFF162040),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      insetPadding: const EdgeInsets.all(20),
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text("교재 난이도 히트맵", style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 4),
-          const Text("집중도가 낮아진 구간을 자동으로 감지합니다", style: TextStyle(color: Colors.white60, fontSize: 12)),
-          const SizedBox(height: 20),
-          if (_heatmapMarks.isEmpty)
-            const Center(child: Padding(padding: EdgeInsets.all(20),
-              child: Text("아직 감지된 구간이 없습니다", style: TextStyle(color: Colors.white60))))
-          else
-            for (final mark in _heatmapMarks) _buildHeatmapItem(mark),
-          if (_heatmapMarks.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const Text("구간별 영향 학생 수", style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            SizedBox(height: 130, child: BarChart(BarChartData(
-              alignment: BarChartAlignment.spaceAround, maxY: 32,
-              gridData: FlGridData(show: false), borderData: FlBorderData(show: false),
-              titlesData: FlTitlesData(
-                leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true,
-                  getTitlesWidget: (v, _) {
-                    final i = v.toInt();
-                    if (i < 0 || i >= _heatmapMarks.length) return const SizedBox();
-                    return Text("${_heatmapMarks[i]['minute']}분", style: const TextStyle(color: Colors.white60, fontSize: 10));
-                  })),
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: const Color(0xFF162040),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        insetPadding: const EdgeInsets.all(20),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('PDF Page Focus Heatmap', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text(
+                _totalPages > 0
+                    ? 'Average engagement by page (total pages: $_totalPages)'
+                    : 'Average engagement by page',
+                style: const TextStyle(color: Colors.white60, fontSize: 12),
               ),
-              barGroups: [for (int i = 0; i < _heatmapMarks.length; i++)
-                BarChartGroupData(x: i, barRods: [BarChartRodData(
-                  toY: (_heatmapMarks[i]['count'] as int).toDouble(),
-                  color: const Color(0xFFE74C3C), width: 24, borderRadius: BorderRadius.circular(4))])],
-            ))),
-          ],
-          const SizedBox(height: 12),
-          Align(alignment: Alignment.centerRight,
-            child: TextButton(onPressed: () => Navigator.pop(ctx),
-              child: const Text("닫기", style: TextStyle(color: Colors.white60)))),
-        ]),
+              const SizedBox(height: 20),
+              if (_pageFocus.isEmpty)
+                const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Text('No page-level data yet.', style: TextStyle(color: Colors.white60)),
+                  ),
+                )
+              else
+                Builder(
+                  builder: (_) {
+                    final byPage = {for (final p in _pageFocus) p.page: p.score};
+                    final cells = <Widget>[];
+                    if (_totalPages > 0) {
+                      for (var p = 1; p <= _totalPages; p++) {
+                        final score = byPage[p];
+                        cells.add(score == null ? _buildEmptyHeatCell(p) : _buildHeatCell(p, score));
+                      }
+                    } else {
+                      for (final page in _pageFocus) {
+                        cells.add(_buildHeatCell(page.page, page.score));
+                      }
+                    }
+                    return Wrap(spacing: 8, runSpacing: 8, children: cells);
+                  },
+                ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  _legendDot(const Color(0xFFE74C3C), '<50'),
+                  const SizedBox(width: 10),
+                  _legendDot(const Color(0xFFF39C12), '50-69'),
+                  const SizedBox(width: 10),
+                  _legendDot(const Color(0xFF2ECC71), '70+'),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Align(
+                alignment: Alignment.centerRight,
+      child: TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Close', style: TextStyle(color: Colors.white60)),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
-    ));
+    );
   }
+
+  Widget _legendDot(Color color, String text) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(width: 10, height: 10, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 4),
+        Text(text, style: const TextStyle(color: Colors.white60, fontSize: 11)),
+      ],
+    );
+  }
+}
+
+class _StudentFocus {
+  final String studentId;
+  final String studentName;
+  final int score;
+  final String? timestamp;
+  final bool isOffline;
+
+  const _StudentFocus({
+    required this.studentId,
+    required this.studentName,
+    required this.score,
+    required this.timestamp,
+    required this.isOffline,
+  });
+}
+
+class _PageBucket {
+  double sum = 0.0;
+  int count = 0;
+
+  void add(double value) {
+    sum += value;
+    count += 1;
+  }
+}
+
+class _PageFocus {
+  final int page;
+  final int score;
+
+  const _PageFocus({required this.page, required this.score});
+}
+
+class _StudentAggregate {
+  double sum = 0.0;
+  int count = 0;
+  String? latestTimestamp;
+}
+
+class _PageStudentScore {
+  final String studentId;
+  final String studentName;
+  final int score;
+  final String? timestamp;
+  final bool isOffline;
+
+  const _PageStudentScore({
+    required this.studentId,
+    required this.studentName,
+    required this.score,
+    required this.timestamp,
+    required this.isOffline,
+  });
 }

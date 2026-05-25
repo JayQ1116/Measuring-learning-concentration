@@ -20,6 +20,8 @@ dependencies:
   file_selector: ^1.1.0
   google_generative_ai: ^0.4.6
   supabase_flutter: ^2.5.1
+  syncfusion_flutter_pdfviewer: ^24.2.9
+  syncfusion_flutter_pdf: ^24.2.9
 
   firebase_core: ^3.6.0
   firebase_auth: ^5.3.1
@@ -28,6 +30,7 @@ dependencies:
   file_picker: ^8.0.0+1
   image: ^4.1.7
   js: ^0.7.1
+  uuid: ^4.4.0
 
 dev_dependencies:
   flutter_test:

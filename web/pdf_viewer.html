@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; font-family: Arial, sans-serif; }
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #ffffff;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    #toolbar button {
+      padding: 6px 10px;
+      border: 1px solid #d1d5db;
+      background: #f9fafb;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #page-info { margin-left: auto; font-weight: 600; }
+    #viewer { flex: 1; overflow: auto; background: #f3f4f6; display: flex; justify-content: center; }
+    canvas { margin: 16px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.12); background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="prev">Prev</button>
+    <button id="next">Next</button>
+    <div id="page-info">1 / 1</div>
+  </div>
+  <div id="viewer">
+    <canvas id="pdf-canvas"></canvas>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const fileUrl = params.get('file');
+    const pdfjsLib = window['pdfjs-dist/build/pdf'];
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    const canvas = document.getElementById('pdf-canvas');
+    const ctx = canvas.getContext('2d');
+    const prevBtn = document.getElementById('prev');
+    const nextBtn = document.getElementById('next');
+    const pageInfo = document.getElementById('page-info');
+
+    let pdfDoc = null;
+    let pageNum = 1;
+    let pageRendering = false;
+    let pageNumPending = null;
+
+    function sendPage() {
+      if (!pdfDoc) return;
+      const payload = { type: 'pdf-page', page: pageNum, total: pdfDoc.numPages };
+      window.parent.postMessage(JSON.stringify(payload), '*');
+      pageInfo.textContent = pageNum + ' / ' + pdfDoc.numPages;
+      prevBtn.disabled = pageNum <= 1;
+      nextBtn.disabled = pageNum >= pdfDoc.numPages;
+    }
+
+    function sendCapture() {
+      if (!canvas || !pdfDoc) return;
+      try {
+        const dataUrl = canvas.toDataURL('image/png');
+        const payload = {
+          type: 'pdf-capture',
+          page: pageNum,
+          total: pdfDoc.numPages,
+          image: dataUrl,
+        };
+        window.parent.postMessage(JSON.stringify(payload), '*');
+      } catch (err) {
+        console.error('Capture failed', err);
+      }
+    }
+
+    function renderPage(num) {
+      pageRendering = true;
+      pdfDoc.getPage(num).then(function(page) {
+        const viewport = page.getViewport({ scale: 1.25 });
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        const renderContext = { canvasContext: ctx, viewport: viewport };
+        const renderTask = page.render(renderContext);
+        renderTask.promise.then(function() {
+          pageRendering = false;
+          if (pageNumPending !== null) {
+            renderPage(pageNumPending);
+            pageNumPending = null;
+          }
+          sendPage();
+        });
+      });
+    }
+
+    function queueRenderPage(num) {
+      if (pageRendering) {
+        pageNumPending = num;
+      } else {
+        renderPage(num);
+      }
+    }
+
+    prevBtn.addEventListener('click', function() {
+      if (pageNum <= 1) return;
+      pageNum -= 1;
+      queueRenderPage(pageNum);
+    });
+
+    nextBtn.addEventListener('click', function() {
+      if (pageNum >= pdfDoc.numPages) return;
+      pageNum += 1;
+      queueRenderPage(pageNum);
+    });
+
+    window.addEventListener('message', function(event) {
+      if (!event || !event.data) return;
+      let data = event.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (_) { return; }
+      }
+      if (data && data.type === 'pdf-capture-request') {
+        sendCapture();
+      }
+    });
+
+    if (!fileUrl) {
+      pageInfo.textContent = 'No file';
+    } else {
+      pdfjsLib.getDocument(decodeURIComponent(fileUrl)).promise
+        .then(function(pdf) {
+          pdfDoc = pdf;
+          pageNum = 1;
+          renderPage(pageNum);
+        })
+        .catch(function(err) {
+          console.error('PDF load error', err);
+          pageInfo.textContent = 'Load failed';
+        });
+    }
+  </script>
+</body>
+</html>

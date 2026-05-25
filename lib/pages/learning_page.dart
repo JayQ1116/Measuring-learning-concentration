@@ -3,6 +3,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 // ignore: avoid_web_libraries_in_flutter
 import 'dart:html' as html;
 
@@ -11,25 +12,30 @@ import 'package:flutter/material.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:http/http.dart' as http;
 import 'package:percent_indicator/circular_percent_indicator.dart';
-// ignore: undefined_prefixed_name
-import 'dart:ui_web' as ui_web;
+import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import '../utils/platform_view_registry.dart';
 
 import 'report_page.dart';
+enum _AiAlertType { lowFocus, highConfusion }
 
 // ── 설정 ──────────────────────────────────────
-const String _kGeminiApiKey = 'AIzaSyD_qyYVJF411bsNXgGThAPHMN0xTtUv9MI';
-const String _kFlaskBaseUrl = 'http://192.168.200.191:5001';
+const String _kGeminiApiKey = 'AIzaSyCdlkOyWaq2B6wTNcDfgMzfPKwOib77VlY';
+const String _kFlaskBaseUrl = 'http://127.0.0.1:5001';
 
 class StudentLearningPage extends StatefulWidget {
   final String courseName;
   final String studentId;
   final String? pdfUrl; // ← 교사가 올린 PDF URL
+  final String? pdfId;
 
   const StudentLearningPage({
     super.key,
     required this.courseName,
     required this.studentId,
     this.pdfUrl,
+    this.pdfId,
   });
 
   @override
@@ -37,10 +43,21 @@ class StudentLearningPage extends StatefulWidget {
 }
 
 class _StudentLearningPageState extends State<StudentLearningPage> {
+  final _supabase = Supabase.instance.client;
 
   // PDF
   String? _pdfUrl;
   String? _pdfName;
+  Uint8List? _pdfBytes;
+  final PdfViewerController _pdfController = PdfViewerController();
+  int _currentPage = 1;
+  int _totalPages = 1;
+  Timer? _pageSaveTimer;
+  int? _lastSavedPage;
+  bool _pdfLoading = false;
+  String? _pdfLoadError;
+  String? _pdfIframeViewType;
+  StreamSubscription<html.MessageEvent>? _pdfMessageSub;
 
   // 웹 카메라
   html.VideoElement? _videoElement;
@@ -50,12 +67,23 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
   bool _isProcessingFrame = false;
   int _lastInferenceTime = 0;
   Timer? _inferenceTimer;
+  bool _flaskChecking = false;
+  Map<String, dynamic>? _lastInferenceData;
+  int? _lastInferenceMetricId;
 
   // 전문도
   double _focusScore = 0.85;
   bool _showAiBubble = false;
+  _AiAlertType _aiAlertType = _AiAlertType.lowFocus;
   int _focusedSec = 0;
   int _confusedSec = 0;
+  double _lastConfusion = 0.0;
+  bool _showInlineAlert = false;
+  String _inlineAlertMsg = '';
+  Timer? _inlineAlertTimer;
+  bool _askCurrentPageMode = false;
+  Completer<Uint8List?>? _pdfCaptureCompleter;
+  final TextEditingController _aiInputCtrl = TextEditingController();
 
   // Gemini
   late final GenerativeModel _geminiModel;
@@ -67,7 +95,7 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
   void initState() {
     super.initState();
     _geminiModel = GenerativeModel(
-      model: 'gemini-2.0-flash',
+      model: 'gemini-3.1-flash-lite',
       apiKey: _kGeminiApiKey,
       systemInstruction: Content.system(
         '당신은 학생의 학습을 돕는 친절한 AI 도우미입니다. '
@@ -80,6 +108,11 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
     if (widget.pdfUrl != null && widget.pdfUrl!.isNotEmpty) {
       _pdfUrl = widget.pdfUrl;
       _pdfName = widget.courseName;
+      _pdfLoading = true;
+      _pdfLoadError = null;
+      _registerPdfIframe();
+      _attachPdfMessageListener();
+      _loadPdfBytes();
     }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -87,10 +120,105 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
     });
   }
 
+  void _registerPdfIframe() {
+    if (!kIsWeb || _pdfUrl == null) return;
+    final viewType = 'pdf-iframe-${DateTime.now().millisecondsSinceEpoch}';
+    _pdfIframeViewType = viewType;
+    final viewerUrl =
+        'pdf_viewer.html?file=${Uri.encodeComponent(_pdfUrl!)}';
+    registerPdfViewFactory(viewType, viewerUrl);
+    // Enable iframe pointer events so PDF is interactive in split layout.
+    _setPdfIframePointerEvents(true);
+  }
+
+  void _attachPdfMessageListener() {
+    if (!kIsWeb) return;
+    _pdfMessageSub?.cancel();
+    _pdfMessageSub = html.window.onMessage.listen((event) {
+      if (event.data is! String) return;
+      try {
+        final data = jsonDecode(event.data as String) as Map<String, dynamic>;
+        final type = data['type'] as String?;
+        if (type == 'pdf-page') {
+          final page = (data['page'] as num?)?.toInt();
+          final total = (data['total'] as num?)?.toInt();
+          if (page == null || total == null || total <= 0) return;
+          if (!mounted) return;
+          setState(() {
+            _pdfLoading = false;
+            _pdfLoadError = null;
+            _currentPage = page;
+            _totalPages = total;
+          });
+          _pageSaveTimer?.cancel();
+          _pageSaveTimer = Timer(
+            const Duration(milliseconds: 400),
+            () => _savePdfPage(_currentPage),
+          );
+          return;
+        }
+        if (type == 'pdf-capture') {
+          final image = data['image'] as String?;
+          if (image == null || image.isEmpty) return;
+          final prefix = 'data:image/png;base64,';
+          final base64Payload = image.startsWith(prefix) ? image.substring(prefix.length) : image;
+          final bytes = base64Decode(base64Payload);
+          _pdfCaptureCompleter?.complete(bytes);
+          _pdfCaptureCompleter = null;
+        }
+      } catch (_) {
+        // Ignore unrelated postMessage payloads.
+      }
+    });
+  }
+
+  Future<void> _loadPdfBytes() async {
+    if (_pdfUrl == null) return;
+    try {
+      final res = await http.get(Uri.parse(_pdfUrl!));
+      final contentType = res.headers['content-type'] ?? 'unknown';
+      debugPrint(
+          '[PDF] 다운로드 상태=${res.statusCode} bytes=${res.bodyBytes.length} content-type=$contentType');
+      if (res.bodyBytes.length >= 8) {
+        final head = String.fromCharCodes(res.bodyBytes.take(8));
+        final tail = String.fromCharCodes(res.bodyBytes.skip(
+            res.bodyBytes.length > 12 ? res.bodyBytes.length - 12 : 0));
+        debugPrint('[PDF] header=$head');
+        debugPrint('[PDF] tail=$tail');
+      }
+      if (res.statusCode == 200 && res.bodyBytes.isNotEmpty) {
+        Uint8List bytes = res.bodyBytes;
+        try {
+          final doc = PdfDocument(inputBytes: bytes);
+          final normalized = await doc.save();
+          doc.dispose();
+          bytes = Uint8List.fromList(normalized);
+          debugPrint('[PDF] 정규화 완료 bytes=${bytes.length}');
+        } catch (e) {
+          debugPrint('[PDF] 정규화 실패: $e');
+        }
+        if (mounted) {
+          setState(() {
+            _pdfBytes = bytes;
+          });
+        } else {
+          _pdfBytes = bytes;
+        }
+      } else {
+        debugPrint('[PDF] 다운로드 실패: ${res.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('[PDF] 다운로드 실패: $e');
+    }
+  }
+
   @override
   void dispose() {
     _inferenceTimer?.cancel();
+    _pageSaveTimer?.cancel();
+    _pdfMessageSub?.cancel();
     _stopCamera();
+    _aiInputCtrl.dispose();
     super.dispose();
   }
 
@@ -117,35 +245,55 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
         ..style.display = 'none';
 
       html.document.body!.append(_videoElement!);
-      await Future.delayed(const Duration(milliseconds: 500));
+      await _videoElement!.play();
+
+      // Wait for video dimensions to be ready.
+      if (_videoElement!.videoWidth == 0 || _videoElement!.videoHeight == 0) {
+        await _videoElement!.onLoadedMetadata.first
+            .timeout(const Duration(seconds: 2));
+      }
 
       if (mounted) {
         setState(() => _cameraReady = true);
         debugPrint('[Camera] 웹 카메라 초기화 성공');
+        _startAiInference();
       }
-
-      await _checkFlask();
-
-      _inferenceTimer = Timer.periodic(
-        const Duration(seconds: 5),
-        (_) => _runWebInference(),
-      );
     } catch (e) {
       debugPrint('[Camera] 웹 카메라 초기화 실패: $e');
     }
   }
 
-  Future<void> _checkFlask() async {
+  Future<bool> _checkFlaskAndStart() async {
+    if (_flaskChecking) return false;
+    _flaskChecking = true;
     try {
       final res = await http
           .get(Uri.parse('$_kFlaskBaseUrl/'))
           .timeout(const Duration(seconds: 3));
       if (res.statusCode == 200) {
         if (mounted) setState(() => _useRealInference = true);
+        _inferenceTimer ??= Timer.periodic(
+          const Duration(seconds: 5),
+          (_) => _runWebInference(),
+        );
         debugPrint('[Flask] 연결 성공');
+        return true;
       }
+      _showSnack('서버에 연결할 수 없습니다');
     } catch (_) {
       debugPrint('[Flask] 서버 없음');
+      _showSnack('서버에 연결할 수 없습니다');
+    } finally {
+      _flaskChecking = false;
+    }
+    return false;
+  }
+
+  Future<void> _startAiInference() async {
+    if (_useRealInference) return;
+    final ok = await _checkFlaskAndStart();
+    if (!ok && mounted) {
+      _showSnack('서버에 연결할 수 없습니다');
     }
   }
 
@@ -154,6 +302,10 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
     if (!_cameraReady || !_useRealInference) return;
     if (_isProcessingFrame) return;
     if (_videoElement == null) return;
+    if (_videoElement!.videoWidth == 0 || _videoElement!.videoHeight == 0) {
+      debugPrint('[Inference] 비디오 크기 0: 프레임 캡처 생략');
+      return;
+    }
 
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastInferenceTime < 5000) return;
@@ -175,12 +327,41 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
       final res = await http.post(
         Uri.parse('$_kFlaskBaseUrl/infer'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'image': base64, 'page': 1}),
+        body: jsonEncode({
+          'image': base64,
+          'page': _currentPage,
+          'client_write': true,
+        }),
       ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        _applyScore((data['focus_score'] as num).toDouble());
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        debugPrint('[Inference] 응답: $data');
+        final state = (data['state'] as String?) ?? '';
+        if (state == 'absent' || state == 'unknown') {
+          debugPrint('[Inference] 얼굴 미검출: UI/저장 업데이트 생략');
+          return;
+        }
+        final metrics = {
+          'engagement': data['engagement'] ?? data['focus_score'],
+          'boredom': data['boredom'] ?? 0.0,
+          'confusion': data['confusion'] ?? 0.0,
+          'frustration': data['frustration'] ?? 0.0,
+          'samples': data['samples'] ?? 1,
+          'pdf_name': data['pdf_name'],
+        };
+
+        final scoreValue = (metrics['engagement'] as num?) ?? 0.0;
+        final confusionValue = (metrics['confusion'] as num?) ?? 0.0;
+        _applyScore(
+          scoreValue.toDouble(),
+          confusion: confusionValue.toDouble(),
+        );
+
+        _lastInferenceData = metrics;
+        await _saveInferenceMetrics(page: _currentPage, metrics: metrics);
+      } else {
+        debugPrint('[Inference] HTTP ${res.statusCode}: ${res.body}');
       }
     } catch (e) {
       debugPrint('[Inference] 오류: $e');
@@ -189,17 +370,101 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
     }
   }
 
-  void _applyScore(double score) {
+  void _applyScore(double score, {double confusion = 0.0}) {
     if (!mounted) return;
     setState(() {
       _focusScore = score.clamp(0.0, 1.0);
-      if (_focusScore >= 0.6) {
+      _lastConfusion = confusion.clamp(0.0, 1.0);
+      final confusionScore = confusion.clamp(0.0, 1.0);
+      final lowFocus = _focusScore < 0.5;
+      final highConfusion = confusionScore > 0.3;
+      if (!lowFocus && !highConfusion) {
         _focusedSec += 5;
       } else {
         _confusedSec += 5;
-        if (!_showAiBubble) _showAiBubble = true;
+        // show short inline alert in Korean for 3 seconds
+        _aiAlertType = highConfusion ? _AiAlertType.highConfusion : _AiAlertType.lowFocus;
+        if (_aiAlertType == _AiAlertType.lowFocus) {
+          _inlineAlertMsg = '집중도가 감소했습니다. 집중해 주세요.';
+        } else {
+          _inlineAlertMsg = '혼란도가 감지되었습니다. 궁금한 점이 있으면 AI에게 물어보세요.';
+        }
+        _showInlineAlert = true;
+        _inlineAlertTimer?.cancel();
+        _inlineAlertTimer = Timer(const Duration(seconds: 3), () {
+          if (mounted) setState(() => _showInlineAlert = false);
+        });
       }
     });
+  }
+
+  void _setPdfIframePointerEvents(bool enabled) {
+    if (!kIsWeb) return;
+    if (_pdfIframeViewType == null) return;
+    setPdfViewPointerEvents(_pdfIframeViewType!, enabled);
+  }
+
+  Future<void> _saveInferenceMetrics({
+    required int page,
+    required Map<String, dynamic> metrics,
+  }) async {
+    debugPrint('[Inference] save start page=$page');
+    if (_pdfUrl == null) return;
+    final authUserId = _supabase.auth.currentUser?.id;
+    if (authUserId == null || authUserId.isEmpty) {
+      debugPrint('[Inference] save skipped: auth session missing');
+      return;
+    }
+    if (authUserId != widget.studentId) {
+      debugPrint('[Inference] save blocked: auth uid($authUserId) != widget.studentId(${widget.studentId})');
+      return;
+    }
+    debugPrint('[Inference] save auth ok uid=$authUserId');
+    final resolvedPdfName = (_pdfName ?? widget.courseName).trim().isNotEmpty
+      ? (_pdfName ?? widget.courseName)
+      : (metrics['pdf_name'] as String?);
+    final resolvedPdfId = widget.pdfId?.trim().isNotEmpty == true
+        ? widget.pdfId
+        : null;
+    if (widget.studentId.isEmpty) {
+      debugPrint('[Inference] studentId 없음: 저장 생략');
+      return;
+    }
+
+    try {
+      final insert = await _supabase
+          .from('engagement_metrics')
+          .insert({
+            'student_id': widget.studentId,
+            'timestamp': DateTime.now().toUtc().toIso8601String(),
+            'engagement': metrics['engagement'],
+            'boredom': metrics['boredom'],
+            'confusion': metrics['confusion'],
+            'frustration': metrics['frustration'],
+            'samples': metrics['samples'] ?? 1,
+            'pdf_page': page,
+            'pdf_name': resolvedPdfName,
+            'pdf_id': resolvedPdfId,
+            'pdf_total_pages': _totalPages,
+          })
+          .select('id')
+          .maybeSingle();
+
+      if (insert != null && insert['id'] != null) {
+        _lastInferenceMetricId = insert['id'] as int;
+      } else {
+        debugPrint('[Inference] Supabase 저장 실패: 응답 없음');
+      }
+    } catch (e) {
+      debugPrint('[Inference] Supabase 저장 실패: $e');
+    }
+  }
+
+
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
   }
 
   // ── Gemini ────────────────────────────────
@@ -226,8 +491,64 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
     }
   }
 
-  void _openGemini() {
-    showModalBottomSheet(
+  Future<void> _sendToGeminiWithImage(String q, Uint8List imageBytes) async {
+    if (q.trim().isEmpty) return;
+    setState(() {
+      _msgs.add(_Msg(text: q, isUser: true));
+      _geminiLoading = true;
+    });
+    try {
+      final pdfName = _pdfName ?? widget.courseName;
+      final content = Content.multi([
+        TextPart('[현재 강의: $pdfName]\n$q'),
+        DataPart('image/png', imageBytes),
+      ]);
+      final res = await _chatSession.sendMessage(content);
+      setState(() {
+        _msgs.add(_Msg(text: res.text ?? '응답 없음', isUser: false));
+      });
+    } catch (e) {
+      setState(() {
+        _msgs.add(_Msg(text: '오류: $e', isUser: false, isError: true));
+      });
+    } finally {
+      if (mounted) setState(() => _geminiLoading = false);
+    }
+  }
+
+  Future<Uint8List?> _requestPdfCapture() async {
+    if (!kIsWeb || _pdfIframeViewType == null) return null;
+    if (_pdfCaptureCompleter != null) return null;
+    _pdfCaptureCompleter = Completer<Uint8List?>();
+    postPdfViewMessage(_pdfIframeViewType!, jsonEncode({'type': 'pdf-capture-request'}));
+    return _pdfCaptureCompleter!.future.timeout(
+      const Duration(seconds: 2),
+      onTimeout: () {
+        _pdfCaptureCompleter = null;
+        return null;
+      },
+    );
+  }
+
+  void _sendAiQuestion(String q) async {
+    if (q.trim().isEmpty) return;
+    if (_askCurrentPageMode) {
+      final pdfName = _pdfName ?? widget.courseName;
+      final prompt = '현재 페이지의 내용을 종합하여 대답해 주십시오.\n현재 페이지: $_currentPage/$_totalPages\ncourse: $pdfName\n사용자 문제: $q';
+      final capture = await _requestPdfCapture();
+      if (capture != null) {
+        await _sendToGeminiWithImage(prompt, capture);
+      } else {
+        await _sendToGemini(prompt);
+      }
+      return;
+    }
+    _sendToGemini(q);
+  }
+
+  Future<void> _openGemini() async {
+    _setPdfIframePointerEvents(false);
+    await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -238,6 +559,41 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
         onSend: _sendToGemini,
       ),
     );
+    _setPdfIframePointerEvents(true);
+  }
+
+  Future<void> _savePdfPage(int page) async {
+    if (_pdfUrl == null) return;
+    if (_lastSavedPage == page) return;
+
+    _lastSavedPage = page;
+    final pdfName = _pdfName ?? widget.courseName;
+
+    try {
+      // Prefer updating the most recent inference row written by this page.
+      if (_lastInferenceMetricId != null) {
+        await _supabase
+            .from('engagement_metrics')
+            .update({
+              'pdf_page': page,
+              'pdf_total_pages': _totalPages,
+              'timestamp': DateTime.now().toUtc().toIso8601String(),
+            })
+            .eq('id', _lastInferenceMetricId!);
+        return;
+      }
+
+      // If we have inference data but no ID (insert failed), try inserting once.
+      if (_lastInferenceData != null) {
+        await _saveInferenceMetrics(page: page, metrics: _lastInferenceData!);
+        return;
+      }
+
+      // No inference data available yet; skip to avoid NULL metrics rows.
+      debugPrint('[PDF] 추론 데이터 없음: 페이지 저장 생략');
+    } catch (e) {
+      debugPrint('[PDF] 페이지 저장 실패: $e');
+    }
   }
 
   void _endLearning() {
@@ -249,6 +605,7 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
         builder: (_) => LearningReportPage(
           studentId: widget.studentId,
           courseName: widget.courseName,
+          pdfId: widget.pdfId,
         ),
       ),
     );
@@ -275,8 +632,10 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
                     fontWeight: FontWeight.bold,
                     color: Color(0xFF172B4D))),
             if (_pdfName != null)
-              Text(_pdfName!,
-                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              Text(
+                '${_pdfName!} • $_currentPage/$_totalPages',
+                style: const TextStyle(fontSize: 11, color: Colors.grey),
+              ),
           ],
         ),
         actions: [
@@ -326,98 +685,262 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
           const SizedBox(width: 4),
         ],
       ),
-      body: Stack(
+      body: Row(
         children: [
-          // PDF 뷰어 또는 플레이스홀더
-          _pdfUrl == null ? _placeholder() : _webPdfViewer(),
+          // Left: PDF viewer (3/4)
+          Expanded(
+            flex: 3,
+            child: Stack(
+              children: [
+                // PDF 뷰어 또는 플레이스홀더
+                _pdfUrl == null ? _placeholder() : _pdfViewer(),
+                _pageControls(),
 
-          // 전문도 링
-          Positioned(
-            top: 16,
-            right: 16,
-            child: Container(
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.15),
-                    blurRadius: 10,
-                    spreadRadius: 1,
+                // 전문도 링 (placed inside left column)
+                Positioned(
+                  top: 16,
+                  right: 16,
+                  child: Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.15),
+                          blurRadius: 10,
+                          spreadRadius: 1,
+                        ),
+                      ],
+                    ),
+                    child: CircularPercentIndicator(
+                      radius: 32.0,
+                      lineWidth: 5.0,
+                      percent: _focusScore,
+                      center: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            '${(_focusScore * 100).toInt()}',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: fc,
+                            ),
+                          ),
+                          Text(
+                            'FOCUS',
+                            style: TextStyle(
+                              fontSize: 6,
+                              color: fc,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                      progressColor: fc,
+                      backgroundColor: Colors.black12,
+                      circularStrokeCap: CircularStrokeCap.round,
+                      animation: true,
+                      animateFromLastPercent: true,
+                    ),
                   ),
-                ],
-              ),
-              child: CircularPercentIndicator(
-                radius: 32.0,
-                lineWidth: 5.0,
-                percent: _focusScore,
-                center: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      '${(_focusScore * 100).toInt()}',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: fc,
-                      ),
-                    ),
-                    Text(
-                      'FOCUS',
-                      style: TextStyle(
-                        fontSize: 6,
-                        color: fc,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
                 ),
-                progressColor: fc,
-                backgroundColor: Colors.black12,
-                circularStrokeCap: CircularStrokeCap.round,
-                animation: true,
-                animateFromLastPercent: true,
-              ),
+
+                // inline alert (inside left area)
+                if (_showInlineAlert)
+                  Positioned(
+                    top: 16,
+                    left: 20,
+                    right: 20,
+                    child: Material(
+                      elevation: 6,
+                      borderRadius: BorderRadius.circular(8),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.orange.shade200),
+                        ),
+                        child: Row(children: [
+                          const Icon(Icons.warning_amber_rounded, color: Colors.deepOrange),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(_inlineAlertMsg, style: const TextStyle(color: Colors.black87))),
+                        ]),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
 
-          // AI 기포
-          if (_showAiBubble)
-            Positioned(
-              top: 100,
-              left: 12,
-              right: 12,
-              child: _aiBubble(),
-            ),
+          // Right: AI sidebar (1/4)
+          Expanded(flex: 1, child: _aiSidebar()),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openGemini,
-        backgroundColor: const Color(0xFF3B71CA),
-        icon: const Icon(Icons.auto_awesome, color: Colors.white),
-        label: const Text('AI 질문', style: TextStyle(color: Colors.white)),
-      ),
+      floatingActionButton: null,
     );
   }
 
-  // ── Web PDF 뷰어 (iframe) ─────────────────
-  Widget _webPdfViewer() {
-    final viewId = 'pdf-${widget.courseName.hashCode}';
+  // ── PDF 뷰어 (Syncfusion) ─────────────────
+  Widget _pdfViewer() {
+    if (kIsWeb && _pdfIframeViewType != null) {
+      return HtmlElementView(viewType: _pdfIframeViewType!);
+    }
 
-    ui_web.platformViewRegistry.registerViewFactory(
-      viewId,
-      (int id) {
-        final iframe = html.IFrameElement()
-          ..src = _pdfUrl
-          ..style.width = '100%'
-          ..style.height = '100%'
-          ..style.border = 'none';
-        return iframe;
-      },
+    return Stack(
+      children: [
+        AbsorbPointer(
+          absorbing: false,
+          child: _pdfBytes != null
+              ? SfPdfViewer.memory(
+                  _pdfBytes!,
+                  controller: _pdfController,
+                  onDocumentLoaded: (details) {
+                    setState(() {
+                      _pdfLoadError = null;
+                      _pdfLoading = false;
+                      _totalPages = details.document.pages.count;
+                      _currentPage = _pdfController.pageNumber;
+                    });
+                    _pageSaveTimer?.cancel();
+                    _pageSaveTimer = Timer(
+                      const Duration(milliseconds: 400),
+                      () => _savePdfPage(_currentPage),
+                    );
+                  },
+                  onDocumentLoadFailed: (details) {
+                    setState(() {
+                      _pdfLoadError = details.description;
+                      _pdfLoading = false;
+                    });
+                    debugPrint('[PDF] 로드 실패: ${details.description}');
+                  },
+                  onPageChanged: (details) {
+                    setState(() {
+                      _currentPage = details.newPageNumber;
+                    });
+                    _pageSaveTimer?.cancel();
+                    _pageSaveTimer = Timer(
+                      const Duration(milliseconds: 400),
+                      () => _savePdfPage(_currentPage),
+                    );
+                  },
+                )
+              : SfPdfViewer.network(
+                  _pdfUrl!,
+                  controller: _pdfController,
+                  onDocumentLoaded: (details) {
+                    setState(() {
+                      _pdfLoadError = null;
+                      _pdfLoading = false;
+                      _totalPages = details.document.pages.count;
+                      _currentPage = _pdfController.pageNumber;
+                    });
+                    _pageSaveTimer?.cancel();
+                    _pageSaveTimer = Timer(
+                      const Duration(milliseconds: 400),
+                      () => _savePdfPage(_currentPage),
+                    );
+                  },
+                  onDocumentLoadFailed: (details) {
+                    setState(() {
+                      _pdfLoadError = details.description;
+                      _pdfLoading = false;
+                    });
+                    debugPrint('[PDF] 로드 실패: ${details.description}');
+                  },
+                  onPageChanged: (details) {
+                    setState(() {
+                      _currentPage = details.newPageNumber;
+                    });
+                    _pageSaveTimer?.cancel();
+                    _pageSaveTimer = Timer(
+                      const Duration(milliseconds: 400),
+                      () => _savePdfPage(_currentPage),
+                    );
+                  },
+                ),
+        ),
+        if (_pdfLoading)
+          const Center(child: CircularProgressIndicator()),
+        if (_pdfLoadError != null)
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, size: 40, color: Colors.redAccent),
+                  const SizedBox(height: 12),
+                  Text(
+                    'PDF 로드 실패\n$_pdfLoadError',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.redAccent),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
+  }
 
-    return HtmlElementView(viewType: viewId);
+  void _goToPage(int page) {
+    if (page < 1 || page > _totalPages) return;
+
+    // 翻页后强制恢复 iframe pointer
+    _setPdfIframePointerEvents(true);
+
+    _pdfController.jumpToPage(page);
+
+    setState(() => _currentPage = page);
+  }
+
+  Widget _pageControls() {
+    if (kIsWeb && _pdfIframeViewType != null) {
+      return const SizedBox.shrink();
+    }
+
+    return Positioned(
+      bottom: 20,
+      left: 20,
+      right: 20,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.1),
+              blurRadius: 10,
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            IconButton(
+              onPressed: _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
+              icon: const Icon(Icons.chevron_left),
+            ),
+            Expanded(
+              child: Center(
+                child: Text('$_currentPage / $_totalPages',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ),
+            IconButton(
+              onPressed: _currentPage < _totalPages
+                  ? () => _goToPage(_currentPage + 1)
+                  : null,
+              icon: const Icon(Icons.chevron_right),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _placeholder() {
@@ -483,6 +1006,14 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
                           color: Color(0xFF172B4D))),
                   const SizedBox(height: 4),
                   Text(
+                    _aiAlertType == _AiAlertType.highConfusion
+                        ? '提醒类型: 疑惑度过高'
+                        : '提醒类型: 专注度下降',
+                    style: const TextStyle(
+                        fontSize: 11, color: Colors.deepOrange),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
                     '집중도가 ${(_focusScore * 100).toInt()}%로 떨어졌어요! 😮\n'
                     '이해가 안 되는 부분이 있나요?',
                     style: const TextStyle(
@@ -493,8 +1024,10 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
                     children: [
                       Expanded(
                         child: OutlinedButton(
-                          onPressed: () =>
-                              setState(() => _showAiBubble = false),
+                          onPressed: () => setState(() {
+                            _showAiBubble = false;
+                            _setPdfIframePointerEvents(true);
+                          }),
                           style: OutlinedButton.styleFrom(
                             padding:
                                 const EdgeInsets.symmetric(vertical: 8),
@@ -509,7 +1042,10 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () {
-                            setState(() => _showAiBubble = false);
+                            setState(() {
+                              _showAiBubble = false;
+                              _setPdfIframePointerEvents(true);
+                            });
                             _sendToGemini('지금 보고 있는 내용을 쉽게 설명해줘');
                             _openGemini();
                           },
@@ -533,13 +1069,254 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
             ),
             IconButton(
               icon: const Icon(Icons.close, size: 16, color: Colors.grey),
-              onPressed: () => setState(() => _showAiBubble = false),
+              onPressed: () => setState(() {
+                _showAiBubble = false;
+                _setPdfIframePointerEvents(true);
+              }),
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(),
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _aiBubbleV2() {
+    final isConfusion = _aiAlertType == _AiAlertType.highConfusion;
+    final title = isConfusion ? 'AI 학습 도우미 · 혼란도 알림' : 'AI 학습 도우미 · 집중도 알림';
+    final subtitle = isConfusion ? '알림 유형: 혼란도 높음' : '알림 유형: 집중도 저하';
+    final body = isConfusion
+        ? '현재 내용에서 헷갈림이 감지되었어요.\n핵심 개념을 쉬운 말로 다시 설명해드릴까요?'
+        : '집중도가 ${(_focusScore * 100).toInt()}%로 떨어졌어요.\n지금 페이지 핵심만 빠르게 정리해드릴까요?';
+    final prompt = isConfusion
+        ? '이 페이지가 헷갈려요. 핵심 개념을 쉬운 예시로 설명해줘.'
+        : '집중이 흐트러졌어요. 지금 페이지 핵심 3줄 요약과 바로 할 다음 행동 1가지만 알려줘.';
+
+    return Material(
+      elevation: 8,
+      borderRadius: const BorderRadius.only(
+        topLeft: Radius.circular(4),
+        topRight: Radius.circular(16),
+        bottomLeft: Radius.circular(16),
+        bottomRight: Radius.circular(16),
+      ),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(4),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(16),
+            bottomRight: Radius.circular(16),
+          ),
+          border: Border.all(color: Colors.orange.withOpacity(0.4)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(7),
+              decoration: BoxDecoration(
+                color: Colors.orange.withOpacity(0.1),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.auto_awesome, color: Colors.orange, size: 18),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                      color: Color(0xFF172B4D),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(fontSize: 11, color: Colors.deepOrange),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    body,
+                    style: const TextStyle(fontSize: 12, height: 1.5, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => setState(() {
+                            _showAiBubble = false;
+                            _setPdfIframePointerEvents(true);
+                          }),
+                          child: const Text('지금은 괜찮아요', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () {
+                            setState(() {
+                              _showAiBubble = false;
+                            });
+
+                            // 打开 Gemini 前禁用 iframe
+                            _setPdfIframePointerEvents(false);
+
+                            _sendToGemini(prompt);
+                            _openGemini();
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF3B71CA),
+                            foregroundColor: Colors.white,
+                          ),
+                          child: const Text('AI 도움 받기', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.close, size: 16, color: Colors.grey),
+              onPressed: () => setState(() {
+                _showAiBubble = false;
+                _setPdfIframePointerEvents(true);
+              }),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _aiSidebar() {
+    return Material(
+      elevation: 8,
+      color: Colors.white,
+      child: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('AI 패널', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      _smallStat('평균 집중도', '${(_focusScore*100).round()}점', Colors.green),
+                      _smallStat('혼란도', '${(_lastConfusion*100).round()}%', Colors.orange),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      _smallStat('학습 시간', '${((_focusedSec+_confusedSec)/60).round()}분', Colors.blue),
+                      _smallStat('현재 페이지', '$_currentPage/$_totalPages', Colors.purple),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text('当前页提问模式', style: TextStyle(fontSize: 12, color: Color(0xFF172B4D))),
+                  ),
+                  Switch.adaptive(
+                    value: _askCurrentPageMode,
+                    onChanged: (v) => setState(() => _askCurrentPageMode = v),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: Column(
+                children: [
+                  Expanded(
+                    child: _msgs.isEmpty
+                        ? Center(child: Text('AI에게 질문하세요', style: TextStyle(color: Colors.grey.shade500)))
+                        : ListView.builder(
+                            padding: const EdgeInsets.all(12),
+                            itemCount: _msgs.length,
+                            itemBuilder: (_, i) => _Bubble(msg: _msgs[i]),
+                          ),
+                  ),
+                  Container(
+                    padding: EdgeInsets.fromLTRB(12, 8, 12, MediaQuery.of(context).viewInsets.bottom + 8),
+                    decoration: BoxDecoration(border: Border(top: BorderSide(color: Colors.grey.shade200))),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _aiInputCtrl,
+                            onSubmitted: (v) {
+                              if (v.trim().isNotEmpty) {
+                                _sendAiQuestion(v.trim());
+                                _aiInputCtrl.clear();
+                              }
+                            },
+                            decoration: InputDecoration(
+                              hintText: 'AI에게 질문하기',
+                              filled: true,
+                              fillColor: const Color(0xFFF4F7FE),
+                              border: OutlineInputBorder(
+                                borderSide: BorderSide.none,
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        GestureDetector(
+                          onTap: () {
+                            final text = _aiInputCtrl.text.trim();
+                            if (text.isEmpty) return;
+                            _sendAiQuestion(text);
+                            _aiInputCtrl.clear();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(color: const Color(0xFF3B71CA), shape: BoxShape.circle),
+                            child: const Icon(Icons.send, color: Colors.white),
+                          ),
+                        )
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _smallStat(String title, String value, Color color) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        const SizedBox(height: 6),
+        Text(value, style: TextStyle(fontWeight: FontWeight.bold, color: color)),
+      ],
     );
   }
 }

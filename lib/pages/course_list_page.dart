@@ -23,6 +23,7 @@ class _CourseListPageState extends State<CourseListPage> {
   final _supabase = Supabase.instance.client;
   List<Map<String, dynamic>> _courses = [];
   bool _loading = true;
+  Map<String, double> _progressByCourse = {};
 
   @override
   void initState() {
@@ -33,14 +34,95 @@ class _CourseListPageState extends State<CourseListPage> {
   Future<void> _loadCourses() async {
     setState(() => _loading = true);
     try {
-      // Supabase에서 강의 목록 로드
+      final boundRows = await _supabase
+          .from('teacher_students')
+          .select('teachers(email)')
+          .eq('student_id', widget.studentId);
+
+      final teacherEmails = boundRows
+          .map((row) => (row['teachers'] as Map<String, dynamic>?)?['email'])
+          .whereType<String>()
+          .where((email) => email.isNotEmpty)
+          .toList();
+
+      if (teacherEmails.isEmpty) {
+        setState(() => _courses = []);
+        return;
+      }
+
       final courses = await _supabase
           .from('courses')
-          .select('id, name, pdf_url, created_at')
+          .select('id, name, pdf_url, pdf_id, created_at, teacher_email')
+          .inFilter('teacher_email', teacherEmails)
           .order('created_at', ascending: false);
+
+      final pdfIds = courses
+          .map((c) => c['pdf_id'])
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      final courseNames = courses
+          .map((c) => c['name'])
+          .whereType<String>()
+          .where((name) => name.isNotEmpty)
+          .toList();
+      final Map<String, String> courseKeyByName = {
+        for (final c in courses)
+          if ((c['name'] as String?)?.isNotEmpty == true)
+            c['name'] as String:
+                ((c['pdf_id'] as String?)?.isNotEmpty == true
+                    ? c['pdf_id'] as String
+                    : c['name'] as String),
+      };
+
+      Map<String, double> progressMap = {};
+      if (pdfIds.isNotEmpty) {
+        final metrics = await _supabase
+            .from('engagement_metrics')
+            .select('pdf_id, pdf_name, pdf_page, pdf_total_pages, timestamp')
+            .eq('student_id', widget.studentId)
+            .inFilter('pdf_id', pdfIds)
+            .order('timestamp', ascending: false);
+
+        for (final row in metrics) {
+          final key = row['pdf_id'] as String?;
+          if (key == null || key.isEmpty || progressMap.containsKey(key)) {
+            continue;
+          }
+          final page = (row['pdf_page'] as num?)?.toDouble();
+          final total = (row['pdf_total_pages'] as num?)?.toDouble();
+          if (page == null || total == null || total <= 0) continue;
+          progressMap[key] = (page / total).clamp(0.0, 1.0);
+        }
+      }
+
+      if (courseNames.isNotEmpty) {
+        final metrics = await _supabase
+            .from('engagement_metrics')
+            .select('pdf_id, pdf_name, pdf_page, pdf_total_pages, timestamp')
+            .eq('student_id', widget.studentId)
+            .inFilter('pdf_name', courseNames)
+            .order('timestamp', ascending: false);
+
+        for (final row in metrics) {
+          final rawName = row['pdf_name'] as String?;
+          final key = row['pdf_id'] as String? ??
+              (rawName != null ? courseKeyByName[rawName] : null) ??
+              rawName;
+          if (key == null || key.isEmpty || progressMap.containsKey(key)) {
+            continue;
+          }
+          final page = (row['pdf_page'] as num?)?.toDouble();
+          final total = (row['pdf_total_pages'] as num?)?.toDouble();
+          if (page == null || total == null || total <= 0) continue;
+          progressMap[key] = (page / total).clamp(0.0, 1.0);
+        }
+      }
 
       setState(() {
         _courses = List<Map<String, dynamic>>.from(courses);
+        _progressByCourse = progressMap;
       });
     } catch (e) {
       debugPrint('[CourseList] 로드 실패: $e');
@@ -123,8 +205,11 @@ class _CourseListPageState extends State<CourseListPage> {
   Widget _courseCard(BuildContext context, Map<String, dynamic> course) {
     final courseId = course['id'] as String;
     final courseName = course['name'] as String;
+    final pdfId = course['pdf_id'] as String?;
     final pdfUrl = course['pdf_url'] as String?;
     final hasPdf = pdfUrl != null && pdfUrl.isNotEmpty;
+    final key = (pdfId != null && pdfId.isNotEmpty) ? pdfId : courseName;
+    final progress = _progressByCourse[key] ?? _progressByCourse[courseName] ?? 0.0;
 
     return Container(
       width: double.infinity,
@@ -176,6 +261,33 @@ class _CourseListPageState extends State<CourseListPage> {
             style: const TextStyle(fontSize: 13, color: Colors.grey),
           ),
           const SizedBox(height: 16),
+          if (progress > 0)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Column(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 8,
+                      backgroundColor: Colors.black12,
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        Color(0xFF3B71CA),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: Text(
+                      '${(progress * 100).toInt()}%',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton(
@@ -186,7 +298,8 @@ class _CourseListPageState extends State<CourseListPage> {
                           builder: (_) => StudentLearningPage(
                             courseName: courseName,
                             studentId: widget.studentId,
-                            pdfUrl: pdfUrl!, // ← PDF URL 전달
+                            pdfUrl: pdfUrl!,
+                            pdfId: pdfId,
                           ),
                         ),
                       )
