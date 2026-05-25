@@ -21,7 +21,7 @@ import 'report_page.dart';
 enum _AiAlertType { lowFocus, highConfusion }
 
 // ── 설정 ──────────────────────────────────────
-const String _kGeminiApiKey = 'AIzaSyCdlkOyWaq2B6wTNcDfgMzfPKwOib77VlY';
+const String _kGeminiApiKey = '';
 const String _kFlaskBaseUrl = 'http://127.0.0.1:5001';
 
 class StudentLearningPage extends StatefulWidget {
