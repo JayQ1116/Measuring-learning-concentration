@@ -1007,8 +1007,8 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
                   const SizedBox(height: 4),
                   Text(
                     _aiAlertType == _AiAlertType.highConfusion
-                        ? '提醒类型: 疑惑度过高'
-                        : '提醒类型: 专注度下降',
+                        ? '알림 유형: 혼란도 과다'
+                        : '알림 유형: 집중도 저하',
                     style: const TextStyle(
                         fontSize: 11, color: Colors.deepOrange),
                   ),
@@ -1236,7 +1236,7 @@ class _StudentLearningPageState extends State<StudentLearningPage> {
               child: Row(
                 children: [
                   const Expanded(
-                    child: Text('当前页提问模式', style: TextStyle(fontSize: 12, color: Color(0xFF172B4D))),
+                    child: Text('현재 페이지 질문 모드', style: TextStyle(fontSize: 12, color: Color(0xFF172B4D))),
                   ),
                   Switch.adaptive(
                     value: _askCurrentPageMode,
