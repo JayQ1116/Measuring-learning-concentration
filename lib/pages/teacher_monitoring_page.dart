@@ -86,13 +86,19 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
       }
 
       if (studentIds.isEmpty) {
-        if (!mounted) return;
-        setState(() {
-          _timeStr = timeStr;
-          _students = [];
-          _loading = false;
-        });
-        return;
+        final fallbackIds = await _loadStudentIdsFromMetrics();
+        for (final id in fallbackIds) {
+          if (!studentIds.contains(id)) studentIds.add(id);
+        }
+        if (studentIds.isEmpty) {
+          if (!mounted) return;
+          setState(() {
+            _timeStr = timeStr;
+            _students = [];
+            _loading = false;
+          });
+          return;
+        }
       }
 
       final unresolved = studentIds.where((id) => !nameById.containsKey(id)).toList();
@@ -241,6 +247,31 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
     await tryKey('email');
   }
 
+  Future<List<String>> _loadStudentIdsFromMetrics() async {
+    try {
+      var query = _supabase
+          .from('engagement_metrics')
+          .select('student_id');
+
+      if (widget.pdfId != null && widget.pdfId!.isNotEmpty) {
+        query = query.eq('pdf_id', widget.pdfId!);
+      } else {
+        query = query.eq('pdf_name', widget.courseName);
+      }
+
+      final rows = await query.order('timestamp', ascending: false).limit(2000);
+      final ids = <String>{};
+      for (final row in rows) {
+        final id = row['student_id'] as String?;
+        if (id != null && id.isNotEmpty) ids.add(id);
+      }
+      return ids.toList();
+    } catch (e) {
+      debugPrint('[TeacherMonitoringPage] fallback load failed: $e');
+      return const <String>[];
+    }
+  }
+
   Color _focusColor(int score) {
     if (score >= 70) return const Color(0xFF2ECC71);
     if (score >= 50) return const Color(0xFFF39C12);
@@ -251,8 +282,12 @@ class _TeacherMonitoringPageState extends State<TeacherMonitoringPage> {
     if (timestamp == null || timestamp.isEmpty) return true;
     final ts = DateTime.tryParse(timestamp);
     if (ts == null) return true;
-    final diff = DateTime.now().toUtc().difference(ts.toUtc()).inSeconds.abs();
-    return diff > 5;
+    // If timestamp has no timezone info, treat it as local time.
+    final hasZone = timestamp.endsWith('Z') || timestamp.contains('+') || timestamp.contains('-');
+    final now = hasZone ? DateTime.now().toUtc() : DateTime.now();
+    final adjustedTs = hasZone ? ts.toUtc() : ts;
+    final diff = now.difference(adjustedTs).inSeconds.abs();
+    return diff > 15;
   }
 
   @override
